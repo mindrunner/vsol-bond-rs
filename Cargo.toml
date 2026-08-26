@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Guarded vSOL invoice payment automation for Solana validators"
-repository = "https://github.com/lukius/vsol-bond-rs"
+repository = "https://github.com/mindrunner/vsol-bond-rs"
 
 [dependencies]
 anyhow = "1.0.102"
