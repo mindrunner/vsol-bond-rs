@@ -157,6 +157,7 @@ pub fn validate_deposit_accounts(
     pool: &ValidatedStakePool,
     mint_account: &ChainAccount,
     reserve_account: &ChainAccount,
+    manager_fee_address: Pubkey,
     manager_fee_account: &ChainAccount,
 ) -> Result<()> {
     if pool.pool_mint != vsol_mint()
@@ -170,7 +171,7 @@ pub fn validate_deposit_accounts(
     }
     validate_pool_mint(pool, mint_account)?;
     validate_reserve_stake(pool, reserve_account)?;
-    validate_manager_fee(pool, manager_fee_account)
+    validate_manager_fee(pool, manager_fee_address, manager_fee_account)
 }
 
 fn validate_pool_mint(pool: &ValidatedStakePool, account: &ChainAccount) -> Result<()> {
@@ -211,13 +212,19 @@ fn validate_reserve_stake(pool: &ValidatedStakePool, account: &ChainAccount) -> 
     }
 }
 
-fn validate_manager_fee(pool: &ValidatedStakePool, account: &ChainAccount) -> Result<()> {
-    if account.owner != token_program_id() || account.data.len() != 165 {
+fn validate_manager_fee(
+    pool: &ValidatedStakePool,
+    address: Pubkey,
+    account: &ChainAccount,
+) -> Result<()> {
+    if address != pool.manager_fee_account
+        || account.owner != token_program_id()
+        || account.data.len() != 165
+    {
         bail!("manager fee account has invalid program owner or length");
     }
     let mint = Pubkey::new_from_array(account.data[0..32].try_into()?);
-    let owner = Pubkey::new_from_array(account.data[32..64].try_into()?);
-    if mint != vsol_mint() || owner != pool.manager || account.data[108] != 1 {
+    if mint != vsol_mint() || account.data[108] != 1 {
         bail!("manager fee token account relationships are invalid");
     }
     Ok(())
@@ -645,24 +652,76 @@ mod tests {
             owner: token_program_id(),
             data: token_account_data(vsol_mint(), pool.manager, 0),
         };
-        validate_deposit_accounts(&pool, &mint, &reserve, &manager_fee).expect("valid accounts");
+        validate_deposit_accounts(
+            &pool,
+            &mint,
+            &reserve,
+            pool.manager_fee_account,
+            &manager_fee,
+        )
+        .expect("valid accounts");
 
         let mut bad_mint = mint.clone();
         bad_mint.data[4..36].copy_from_slice(Pubkey::new_unique().as_ref());
-        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &bad_mint,
+                &reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
         let mut bad_mint = mint.clone();
         bad_mint.data[36..44].copy_from_slice(&9_999_u64.to_le_bytes());
-        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &bad_mint,
+                &reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
         let mut bad_mint = mint.clone();
         bad_mint.data[46..50].copy_from_slice(&1_u32.to_le_bytes());
-        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &bad_mint,
+                &reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
 
         let mut bad_reserve = reserve.clone();
         bad_reserve.owner = Pubkey::new_unique();
-        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &mint,
+                &bad_reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
         let mut bad_reserve = reserve.clone();
         bad_reserve.data = bincode::serialize(&StakeStateV2::Uninitialized).unwrap();
-        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &mint,
+                &bad_reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
         let mut bad_reserve = reserve.clone();
         bad_reserve.data = bincode::serialize(&StakeStateV2::Initialized(Meta {
             rent_exempt_reserve: 1,
@@ -670,17 +729,68 @@ mod tests {
             lockup: Lockup::default(),
         }))
         .unwrap();
-        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+        assert!(
+            validate_deposit_accounts(
+                &pool,
+                &mint,
+                &bad_reserve,
+                pool.manager_fee_account,
+                &manager_fee,
+            )
+            .is_err()
+        );
 
-        let mut bad_fee = manager_fee.clone();
-        bad_fee.data[32..64].copy_from_slice(Pubkey::new_unique().as_ref());
-        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+        assert!(
+            validate_deposit_accounts(&pool, &mint, &reserve, Pubkey::new_unique(), &manager_fee,)
+                .is_err()
+        );
         let mut bad_fee = manager_fee.clone();
         bad_fee.data[..32].copy_from_slice(Pubkey::new_unique().as_ref());
-        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+        assert!(
+            validate_deposit_accounts(&pool, &mint, &reserve, pool.manager_fee_account, &bad_fee,)
+                .is_err()
+        );
         let mut bad_fee = manager_fee;
         bad_fee.owner = Pubkey::new_unique();
-        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+        assert!(
+            validate_deposit_accounts(&pool, &mint, &reserve, pool.manager_fee_account, &bad_fee,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_manager_fee_token_authority_different_from_pool_manager() {
+        let pool = pool();
+        let mint = ChainAccount {
+            owner: token_program_id(),
+            data: mint_data(pool.withdraw_authority, pool.pool_token_supply),
+        };
+        let mut reserve_data = bincode::serialize(&StakeStateV2::Initialized(Meta {
+            rent_exempt_reserve: 1,
+            authorized: Authorized::auto(&pool.withdraw_authority),
+            lockup: Lockup::default(),
+        }))
+        .unwrap();
+        reserve_data.resize(200, 0);
+        let reserve = ChainAccount {
+            owner: solana_stake_interface::program::id(),
+            data: reserve_data,
+        };
+        let fee_authority = Pubkey::new_unique();
+        assert_ne!(fee_authority, pool.manager);
+        let manager_fee = ChainAccount {
+            owner: token_program_id(),
+            data: token_account_data(vsol_mint(), fee_authority, 0),
+        };
+
+        validate_deposit_accounts(
+            &pool,
+            &mint,
+            &reserve,
+            pool.manager_fee_account,
+            &manager_fee,
+        )
+        .expect("SPL Stake Pool permits a distinct fee token authority");
     }
 
     #[test]

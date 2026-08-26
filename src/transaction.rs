@@ -12,6 +12,8 @@ use std::{thread, time::Duration};
 
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 const MIN_COMPUTE_UNIT_LIMIT: u32 = 1_000;
+const MAX_RECONCILIATION_POLLS: usize = 240;
+const RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub trait TxSubmitter {
     fn submit(&self, instructions: &[Instruction]) -> Result<Signature>;
@@ -48,6 +50,21 @@ pub enum ReconcileOutcome {
     Confirmed,
     Failed(String),
     ExpiredNotFound,
+    Unresolved(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ObservedStatus {
+    Processed,
+    Confirmed,
+    Failed(String),
+}
+
+trait ReconciliationBackend {
+    fn signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>>;
+    fn blockhash_valid(&self, blockhash: &Hash) -> Result<bool>;
+    fn final_signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>>;
+    fn wait_before_poll(&self);
 }
 
 pub trait SubmissionBackend {
@@ -81,41 +98,126 @@ impl SubmissionBackend for RpcClient {
     }
 
     fn reconcile(&self, signature: &Signature, blockhash: &Hash) -> Result<ReconcileOutcome> {
-        let confirmed = CommitmentConfig::confirmed();
-        loop {
-            let status = self
-                .get_signature_statuses(&[*signature])
-                .context("failed to query transaction status")?
-                .value
-                .into_iter()
-                .next()
-                .flatten();
-            if let Some(status) = status {
-                if let Some(error) = status.err {
-                    return Ok(ReconcileOutcome::Failed(error.to_string()));
-                }
-                if status.satisfies_commitment(confirmed) {
-                    return Ok(ReconcileOutcome::Confirmed);
-                }
-                thread::sleep(Duration::from_millis(500));
-                continue;
+        reconcile_with_backend(self, signature, blockhash, MAX_RECONCILIATION_POLLS)
+    }
+}
+
+impl ReconciliationBackend for RpcClient {
+    fn signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>> {
+        let status = self
+            .get_signature_statuses(&[*signature])
+            .context("failed to query transaction status")?
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+        Ok(status.map(|status| {
+            if let Some(error) = status.err {
+                ObservedStatus::Failed(error.to_string())
+            } else if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                ObservedStatus::Confirmed
+            } else {
+                ObservedStatus::Processed
             }
-            if !self
-                .is_blockhash_valid(blockhash, CommitmentConfig::processed())
-                .context("failed to check blockhash validity")?
-            {
-                let final_status = self
-                    .get_signature_status_with_commitment_and_history(signature, confirmed, true)
-                    .context("failed final transaction status reconciliation")?;
-                return match final_status {
-                    Some(Ok(())) => Ok(ReconcileOutcome::Confirmed),
-                    Some(Err(error)) => Ok(ReconcileOutcome::Failed(error.to_string())),
-                    None => Ok(ReconcileOutcome::ExpiredNotFound),
-                };
+        }))
+    }
+
+    fn blockhash_valid(&self, blockhash: &Hash) -> Result<bool> {
+        self.is_blockhash_valid(blockhash, CommitmentConfig::processed())
+            .context("failed to check blockhash validity")
+    }
+
+    fn final_signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>> {
+        Ok(self
+            .get_signature_status_with_commitment_and_history(
+                signature,
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .context("failed final transaction status reconciliation")?
+            .map(|status| match status {
+                Ok(()) => ObservedStatus::Confirmed,
+                Err(error) => ObservedStatus::Failed(error.to_string()),
+            }))
+    }
+
+    fn wait_before_poll(&self) {
+        thread::sleep(RECONCILIATION_POLL_INTERVAL);
+    }
+}
+
+fn reconcile_with_backend<B: ReconciliationBackend>(
+    backend: &B,
+    signature: &Signature,
+    blockhash: &Hash,
+    max_polls: usize,
+) -> Result<ReconcileOutcome> {
+    if max_polls == 0 {
+        bail!("reconciliation poll limit must be positive");
+    }
+    let mut observed_processed = false;
+    let mut uncertain_read = false;
+    let mut last_transient_error = None;
+
+    for poll in 0..max_polls {
+        match backend.signature_status(signature) {
+            Ok(Some(ObservedStatus::Confirmed)) => return Ok(ReconcileOutcome::Confirmed),
+            Ok(Some(ObservedStatus::Failed(error))) => {
+                return Ok(ReconcileOutcome::Failed(error));
             }
-            thread::sleep(Duration::from_millis(500));
+            Ok(Some(ObservedStatus::Processed)) => observed_processed = true,
+            Ok(None) => {}
+            Err(error) if is_retryable_anyhow(&error) => {
+                uncertain_read = true;
+                last_transient_error = Some(error.to_string());
+            }
+            Err(error) => return Err(error),
+        }
+
+        let blockhash_valid = match backend.blockhash_valid(blockhash) {
+            Ok(valid) => valid,
+            Err(error) if is_retryable_anyhow(&error) => {
+                uncertain_read = true;
+                last_transient_error = Some(error.to_string());
+                if poll + 1 < max_polls {
+                    backend.wait_before_poll();
+                    continue;
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if !blockhash_valid {
+            match backend.final_signature_status(signature) {
+                Ok(Some(ObservedStatus::Confirmed)) => return Ok(ReconcileOutcome::Confirmed),
+                Ok(Some(ObservedStatus::Failed(error))) => {
+                    return Ok(ReconcileOutcome::Failed(error));
+                }
+                Ok(Some(ObservedStatus::Processed)) => observed_processed = true,
+                Ok(None) if !observed_processed && !uncertain_read => {
+                    return Ok(ReconcileOutcome::ExpiredNotFound);
+                }
+                Ok(None) => {}
+                Err(error) if is_retryable_anyhow(&error) => {
+                    uncertain_read = true;
+                    last_transient_error = Some(error.to_string());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if poll + 1 < max_polls {
+            backend.wait_before_poll();
         }
     }
+
+    let detail = last_transient_error
+        .map(|error| format!("; last transient RPC error: {error}"))
+        .unwrap_or_default();
+    Ok(ReconcileOutcome::Unresolved(format!(
+        "transaction status did not settle within {max_polls} polls{detail}"
+    )))
 }
 
 pub fn compute_unit_limit_with_margin(units_consumed: u64) -> u32 {
@@ -161,7 +263,7 @@ pub fn submit_with_backend<B: SubmissionBackend>(
         let blockhash = match backend.latest_blockhash() {
             Ok(blockhash) => blockhash,
             Err(error) => {
-                let retryable = is_retryable_error(&error.to_string());
+                let retryable = is_retryable_anyhow(&error);
                 last_error = Some(error);
                 if retryable && attempt + 1 < max_attempts {
                     continue;
@@ -183,7 +285,7 @@ pub fn submit_with_backend<B: SubmissionBackend>(
         let simulation = match backend.simulate(&simulation_transaction) {
             Ok(simulation) => simulation,
             Err(error) => {
-                let retryable = is_retryable_error(&error.to_string());
+                let retryable = is_retryable_anyhow(&error);
                 last_error = Some(error);
                 if retryable && attempt + 1 < max_attempts {
                     continue;
@@ -220,7 +322,7 @@ pub fn submit_with_backend<B: SubmissionBackend>(
                 bail!("RPC returned a transaction signature mismatch");
             }
             Ok(_) => {}
-            Err(error) if is_retryable_error(&error.to_string()) => {}
+            Err(error) if is_retryable_anyhow(&error) => {}
             Err(error) => return Err(error),
         }
         match backend.reconcile(&local_signature, &blockhash)? {
@@ -235,6 +337,9 @@ pub fn submit_with_backend<B: SubmissionBackend>(
                 if attempt + 1 == max_attempts {
                     break;
                 }
+            }
+            ReconcileOutcome::Unresolved(reason) => {
+                bail!("transaction outcome unresolved; refusing to retry: {reason}");
             }
         }
     }
@@ -264,6 +369,12 @@ pub fn is_retryable_error(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+fn is_retryable_anyhow(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_retryable_error(&cause.to_string()))
 }
 
 #[cfg(test)]
@@ -458,5 +569,108 @@ mod tests {
         assert_eq!(signature, backend.sent_signatures.borrow()[0]);
         assert_eq!(*backend.send_calls.borrow(), 1);
         assert_eq!(*backend.reconcile_calls.borrow(), 1);
+    }
+
+    struct ReconciliationMock {
+        statuses: RefCell<VecDeque<anyhow::Result<Option<ObservedStatus>>>>,
+        validities: RefCell<VecDeque<anyhow::Result<bool>>>,
+        final_statuses: RefCell<VecDeque<anyhow::Result<Option<ObservedStatus>>>>,
+        validity_calls: RefCell<usize>,
+    }
+
+    impl ReconciliationBackend for ReconciliationMock {
+        fn signature_status(
+            &self,
+            _signature: &Signature,
+        ) -> anyhow::Result<Option<ObservedStatus>> {
+            self.statuses.borrow_mut().pop_front().unwrap()
+        }
+
+        fn blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
+            *self.validity_calls.borrow_mut() += 1;
+            self.validities.borrow_mut().pop_front().unwrap()
+        }
+
+        fn final_signature_status(
+            &self,
+            _signature: &Signature,
+        ) -> anyhow::Result<Option<ObservedStatus>> {
+            self.final_statuses.borrow_mut().pop_front().unwrap()
+        }
+
+        fn wait_before_poll(&self) {}
+    }
+
+    #[test]
+    fn reconciliation_recovers_from_transient_status_and_validity_reads() {
+        let backend = ReconciliationMock {
+            statuses: RefCell::new(VecDeque::from([
+                Err(anyhow::anyhow!("transport timeout").context("status RPC failed")),
+                Ok(None),
+                Ok(Some(ObservedStatus::Confirmed)),
+            ])),
+            validities: RefCell::new(VecDeque::from([
+                Err(anyhow::anyhow!("node temporarily unavailable").context("blockhash RPC failed")),
+                Ok(true),
+            ])),
+            final_statuses: RefCell::new(VecDeque::new()),
+            validity_calls: RefCell::new(0),
+        };
+        let outcome = reconcile_with_backend(
+            &backend,
+            &Signature::from([8; 64]),
+            &Hash::new_from_array([7; 32]),
+            4,
+        )
+        .expect("transient reads recover");
+        assert_eq!(outcome, ReconcileOutcome::Confirmed);
+        assert_eq!(*backend.validity_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn perpetually_processed_status_is_bounded_and_checks_expiry() {
+        let backend = ReconciliationMock {
+            statuses: RefCell::new(VecDeque::from([
+                Ok(Some(ObservedStatus::Processed)),
+                Ok(Some(ObservedStatus::Processed)),
+                Ok(Some(ObservedStatus::Processed)),
+            ])),
+            validities: RefCell::new(VecDeque::from([Ok(false), Ok(false), Ok(false)])),
+            final_statuses: RefCell::new(VecDeque::from([Ok(None), Ok(None), Ok(None)])),
+            validity_calls: RefCell::new(0),
+        };
+        let outcome = reconcile_with_backend(
+            &backend,
+            &Signature::from([8; 64]),
+            &Hash::new_from_array([7; 32]),
+            3,
+        )
+        .expect("bounded reconciliation");
+        assert!(matches!(outcome, ReconcileOutcome::Unresolved(_)));
+        assert_eq!(*backend.validity_calls.borrow(), 3);
+    }
+
+    #[test]
+    fn unresolved_reconciliation_does_not_duplicate_submission() {
+        let backend = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
+            send_results: RefCell::new(VecDeque::from([Ok(())])),
+            reconcile_results: RefCell::new(VecDeque::from([Ok(ReconcileOutcome::Unresolved(
+                "processed status did not settle".into(),
+            ))])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        assert!(submit_with_backend(&backend, &Keypair::new(), &[instruction()], 0, 3).is_err());
+        assert_eq!(*backend.send_calls.borrow(), 1);
+        assert_eq!(*backend.latest_calls.borrow(), 1);
     }
 }
