@@ -46,7 +46,7 @@ rpc_url = "https://your-existing-rpc.example"
 vote_account = "YourValidatorVoteAccount"
 payer_pubkey = "PublicKeyOfPayerKeypair"
 payer_keypair_path = "/absolute/path/to/payer.json"
-metrics_path = "/var/lib/node_exporter/textfile_collector/vsol-bond.prom"
+metrics_path = "/var/lib/alloy/textcollector/vsol_payment.prom"
 
 # Guarded defaults shown explicitly.
 max_total_vsol = 5000000000
