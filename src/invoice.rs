@@ -7,6 +7,8 @@ pub const INVOICE_DISCRIMINATOR: [u8; 8] = [51, 194, 250, 114, 6, 104, 18, 164];
 pub const INVOICER_DISCRIMINATOR: [u8; 8] = [130, 60, 88, 174, 12, 36, 237, 134];
 pub const INVOICE_ACCOUNT_LEN: usize = 96;
 pub const INVOICER_ACCOUNT_LEN: usize = 208;
+// The deployed program appended two pubkeys without changing the known prefix.
+const EXTENDED_INVOICER_ACCOUNT_LEN: usize = 272;
 
 const INVOICER_PROGRAM: &str = "EpoivtVh9dgWFxE6MYgF3YnobYWtZr2VfCuP7iT3N927";
 const INVOICER_BASE: &str = "vocefgUvSTg7q4ZfeTLg2RAgeYN6V7t6rNVNb3dzrh1";
@@ -122,7 +124,10 @@ pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoic
     if address != expected_address || account.owner != invoicer_program_id() {
         bail!("invalid invoicer address or owner");
     }
-    if account.data.len() != INVOICER_ACCOUNT_LEN {
+    if !matches!(
+        account.data.len(),
+        INVOICER_ACCOUNT_LEN | EXTENDED_INVOICER_ACCOUNT_LEN
+    ) {
         bail!("invoicer has invalid data length");
     }
     if account.data[..8] != INVOICER_DISCRIMINATOR {
@@ -137,7 +142,7 @@ pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoic
         payment_withdrawer,
         invoice_creator,
         padding,
-    ) = parse_invoicer_layout(&account.data[8..])?;
+    ) = parse_invoicer_layout(&account.data[8..INVOICER_ACCOUNT_LEN])?;
     if base_key != invoicer_base()
         || bump != expected_bump
         || padding != [0; 7]
@@ -334,6 +339,27 @@ mod tests {
         let mut bad = account;
         bad.data[40] ^= 1;
         assert!(decode_invoicer(invoicer_address(), &bad).is_err());
+    }
+
+    #[test]
+    fn decodes_live_extended_invoicer_layout() {
+        let reserves = Pubkey::new_unique();
+        let mut data = invoicer_data(reserves);
+        data.extend_from_slice(&[7; 64]);
+        assert_eq!(data.len(), 272);
+
+        let account = ChainAccount {
+            owner: invoicer_program_id(),
+            data,
+        };
+        let decoded =
+            decode_invoicer(invoicer_address(), &account).expect("extended invoicer account");
+
+        assert_eq!(decoded.vsol_reserves, reserves);
+
+        let mut unsupported = account;
+        unsupported.data.push(0);
+        assert!(decode_invoicer(invoicer_address(), &unsupported).is_err());
     }
 
     #[test]
