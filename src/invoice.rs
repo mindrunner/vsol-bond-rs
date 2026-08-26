@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use bytemuck::{Pod, Zeroable};
 use solana_pubkey::Pubkey;
 use std::{collections::HashSet, str::FromStr};
 
@@ -37,29 +36,6 @@ pub struct Invoicer {
     pub pending_owner: Pubkey,
     pub payment_withdrawer: Pubkey,
     pub invoice_creator: Pubkey,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct RawInvoice {
-    invoicer: [u8; 32],
-    vote_account: [u8; 32],
-    epoch: [u8; 8],
-    amount_vsol: [u8; 8],
-    balance_outstanding: [u8; 8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct RawInvoicer {
-    base_key: [u8; 32],
-    bump: u8,
-    padding: [u8; 7],
-    vsol_reserves: [u8; 32],
-    owner: [u8; 32],
-    pending_owner: [u8; 32],
-    payment_withdrawer: [u8; 32],
-    invoice_creator: [u8; 32],
 }
 
 pub fn invoicer_program_id() -> Pubkey {
@@ -109,15 +85,15 @@ pub fn decode_invoice(
     if account.data[..8] != INVOICE_DISCRIMINATOR {
         bail!("invoice discriminator mismatch");
     }
-    let raw = bytemuck::try_from_bytes::<RawInvoice>(&account.data[8..])
-        .map_err(|_| anyhow::anyhow!("invalid invoice layout"))?;
+    let (invoicer, vote_account, epoch, amount_vsol, balance_outstanding) =
+        parse_invoice_layout(&account.data[8..])?;
     let invoice = Invoice {
         address,
-        invoicer: Pubkey::new_from_array(raw.invoicer),
-        vote_account: Pubkey::new_from_array(raw.vote_account),
-        epoch: u64::from_le_bytes(raw.epoch),
-        amount_vsol: u64::from_le_bytes(raw.amount_vsol),
-        balance_outstanding: u64::from_le_bytes(raw.balance_outstanding),
+        invoicer,
+        vote_account,
+        epoch,
+        amount_vsol,
+        balance_outstanding,
     };
     validate_invoice(&invoice, expected_vote, expected_epoch)?;
     Ok(invoice)
@@ -152,24 +128,80 @@ pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoic
     if account.data[..8] != INVOICER_DISCRIMINATOR {
         bail!("invoicer discriminator mismatch");
     }
-    let raw = bytemuck::try_from_bytes::<RawInvoicer>(&account.data[8..])
-        .map_err(|_| anyhow::anyhow!("invalid invoicer layout"))?;
-    if raw.base_key != invoicer_base().to_bytes()
-        || raw.bump != expected_bump
-        || raw.padding != [0; 7]
-        || raw.vsol_reserves == [0; 32]
+    let (
+        base_key,
+        bump,
+        vsol_reserves,
+        owner,
+        pending_owner,
+        payment_withdrawer,
+        invoice_creator,
+        padding,
+    ) = parse_invoicer_layout(&account.data[8..])?;
+    if base_key != invoicer_base()
+        || bump != expected_bump
+        || padding != [0; 7]
+        || vsol_reserves == Pubkey::default()
     {
         bail!("invoicer derivation fields are invalid");
     }
     Ok(Invoicer {
-        base_key: Pubkey::new_from_array(raw.base_key),
-        bump: raw.bump,
-        vsol_reserves: Pubkey::new_from_array(raw.vsol_reserves),
-        owner: Pubkey::new_from_array(raw.owner),
-        pending_owner: Pubkey::new_from_array(raw.pending_owner),
-        payment_withdrawer: Pubkey::new_from_array(raw.payment_withdrawer),
-        invoice_creator: Pubkey::new_from_array(raw.invoice_creator),
+        base_key,
+        bump,
+        vsol_reserves,
+        owner,
+        pending_owner,
+        payment_withdrawer,
+        invoice_creator,
     })
+}
+
+fn parse_invoice_layout(data: &[u8]) -> Result<(Pubkey, Pubkey, u64, u64, u64)> {
+    if data.len() != INVOICE_ACCOUNT_LEN - 8 {
+        bail!("invalid invoice layout length");
+    }
+    Ok((
+        pubkey_at(data, 0)?,
+        pubkey_at(data, 32)?,
+        u64_at(data, 64)?,
+        u64_at(data, 72)?,
+        u64_at(data, 80)?,
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_invoicer_layout(
+    data: &[u8],
+) -> Result<(Pubkey, u8, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, [u8; 7])> {
+    if data.len() != INVOICER_ACCOUNT_LEN - 8 {
+        bail!("invalid invoicer layout length");
+    }
+    Ok((
+        pubkey_at(data, 0)?,
+        data[32],
+        pubkey_at(data, 40)?,
+        pubkey_at(data, 72)?,
+        pubkey_at(data, 104)?,
+        pubkey_at(data, 136)?,
+        pubkey_at(data, 168)?,
+        data[33..40].try_into()?,
+    ))
+}
+
+fn pubkey_at(data: &[u8], offset: usize) -> Result<Pubkey> {
+    Ok(Pubkey::new_from_array(
+        data.get(offset..offset + 32)
+            .ok_or_else(|| anyhow::anyhow!("pubkey field out of bounds"))?
+            .try_into()?,
+    ))
+}
+
+fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        data.get(offset..offset + 8)
+            .ok_or_else(|| anyhow::anyhow!("u64 field out of bounds"))?
+            .try_into()?,
+    ))
 }
 
 pub fn candidate_epochs(current_epoch: u64) -> Vec<u64> {
@@ -302,6 +334,23 @@ mod tests {
         let mut bad = account;
         bad.data[40] ^= 1;
         assert!(decode_invoicer(invoicer_address(), &bad).is_err());
+    }
+
+    #[test]
+    fn decodes_account_fields_from_unaligned_slices() {
+        let vote = vote_program_id();
+        let invoice = invoice_data(invoicer_address(), vote, 780, 50, 25);
+        let mut unaligned = vec![0xff];
+        unaligned.extend_from_slice(&invoice);
+        let parsed = parse_invoice_layout(&unaligned[9..]).expect("unaligned invoice payload");
+        assert_eq!(parsed.2, 780);
+
+        let reserves = Pubkey::new_unique();
+        let invoicer = invoicer_data(reserves);
+        let mut unaligned = vec![0xff];
+        unaligned.extend_from_slice(&invoicer);
+        let parsed = parse_invoicer_layout(&unaligned[9..]).expect("unaligned invoicer payload");
+        assert_eq!(parsed.2, reserves);
     }
 
     #[test]

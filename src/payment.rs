@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use borsh::BorshDeserialize;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
+use solana_stake_interface::state::StakeStateV2;
 use spl_associated_token_account_interface::{
     address::get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
@@ -17,6 +18,9 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedStakePool {
+    pub manager: Pubkey,
+    pub withdraw_authority: Pubkey,
+    pub withdraw_bump_seed: u8,
     pub reserve_stake: Pubkey,
     pub pool_mint: Pubkey,
     pub manager_fee_account: Pubkey,
@@ -109,25 +113,21 @@ pub fn validate_token_account(
     Ok(u64::from_le_bytes(account.data[64..72].try_into()?))
 }
 
-pub fn validate_vsol_mint(account: &ChainAccount) -> Result<()> {
-    if account.owner != token_program_id() || account.data.len() != 82 {
-        bail!("vSOL mint has invalid owner or length");
-    }
-    if account.data[44] != 9 || account.data[45] != 1 {
-        bail!("vSOL mint decimals or state mismatch");
-    }
-    Ok(())
-}
-
 pub fn decode_stake_pool(account: &ChainAccount, current_epoch: u64) -> Result<ValidatedStakePool> {
     if account.owner != stake_pool_program_id() {
         bail!("stake pool has foreign owner");
     }
     let pool = StakePool::try_from_slice(&account.data)
         .map_err(|error| anyhow::anyhow!("invalid stake pool data: {error}"))?;
+    let (withdraw_authority, withdraw_bump_seed) =
+        spl_stake_pool::find_withdraw_authority_program_address(
+            &stake_pool_program_id(),
+            &stake_pool_address(),
+        );
     if pool.account_type != AccountType::StakePool
         || pool.pool_mint != vsol_mint()
         || pool.token_program_id != token_program_id()
+        || pool.stake_withdraw_bump_seed != withdraw_bump_seed
         || pool.total_lamports == 0
         || pool.pool_token_supply == 0
         || pool.last_update_epoch != current_epoch
@@ -138,6 +138,9 @@ pub fn decode_stake_pool(account: &ChainAccount, current_epoch: u64) -> Result<V
         bail!("stake pool requires an unsupported SOL deposit authority");
     }
     Ok(ValidatedStakePool {
+        manager: pool.manager,
+        withdraw_authority,
+        withdraw_bump_seed,
         reserve_stake: pool.reserve_stake,
         pool_mint: pool.pool_mint,
         manager_fee_account: pool.manager_fee_account,
@@ -148,6 +151,76 @@ pub fn decode_stake_pool(account: &ChainAccount, current_epoch: u64) -> Result<V
         sol_deposit_fee_denominator: pool.sol_deposit_fee.denominator,
         sol_deposit_authority: pool.sol_deposit_authority,
     })
+}
+
+pub fn validate_deposit_accounts(
+    pool: &ValidatedStakePool,
+    mint_account: &ChainAccount,
+    reserve_account: &ChainAccount,
+    manager_fee_account: &ChainAccount,
+) -> Result<()> {
+    if pool.pool_mint != vsol_mint()
+        || pool.token_program_id != token_program_id()
+        || spl_stake_pool::find_withdraw_authority_program_address(
+            &stake_pool_program_id(),
+            &stake_pool_address(),
+        ) != (pool.withdraw_authority, pool.withdraw_bump_seed)
+    {
+        bail!("stake pool program relationships are invalid");
+    }
+    validate_pool_mint(pool, mint_account)?;
+    validate_reserve_stake(pool, reserve_account)?;
+    validate_manager_fee(pool, manager_fee_account)
+}
+
+fn validate_pool_mint(pool: &ValidatedStakePool, account: &ChainAccount) -> Result<()> {
+    if account.owner != token_program_id() || account.data.len() != 82 {
+        bail!("pool mint has invalid program owner or length");
+    }
+    let mint_authority_tag = u32::from_le_bytes(account.data[0..4].try_into()?);
+    let mint_authority = Pubkey::new_from_array(account.data[4..36].try_into()?);
+    let supply = u64::from_le_bytes(account.data[36..44].try_into()?);
+    let freeze_authority_tag = u32::from_le_bytes(account.data[46..50].try_into()?);
+    if mint_authority_tag != 1
+        || mint_authority != pool.withdraw_authority
+        || supply != pool.pool_token_supply
+        || account.data[44] != 9
+        || account.data[45] != 1
+        || freeze_authority_tag != 0
+    {
+        bail!("pool mint authority, supply, decimals, or freeze state mismatch");
+    }
+    Ok(())
+}
+
+fn validate_reserve_stake(pool: &ValidatedStakePool, account: &ChainAccount) -> Result<()> {
+    if account.owner != solana_stake_interface::program::id() {
+        bail!("reserve stake has foreign owner");
+    }
+    let state: StakeStateV2 = bincode::deserialize(&account.data)
+        .map_err(|_| anyhow::anyhow!("invalid reserve stake"))?;
+    match state {
+        StakeStateV2::Initialized(meta)
+            if meta.authorized.staker == pool.withdraw_authority
+                && meta.authorized.withdrawer == pool.withdraw_authority
+                && meta.lockup == Default::default() =>
+        {
+            Ok(())
+        }
+        _ => bail!("reserve stake state or authorities are invalid"),
+    }
+}
+
+fn validate_manager_fee(pool: &ValidatedStakePool, account: &ChainAccount) -> Result<()> {
+    if account.owner != token_program_id() || account.data.len() != 165 {
+        bail!("manager fee account has invalid program owner or length");
+    }
+    let mint = Pubkey::new_from_array(account.data[0..32].try_into()?);
+    let owner = Pubkey::new_from_array(account.data[32..64].try_into()?);
+    if mint != vsol_mint() || owner != pool.manager || account.data[108] != 1 {
+        bail!("manager fee token account relationships are invalid");
+    }
+    Ok(())
 }
 
 pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Result<PaymentPlan> {
@@ -188,6 +261,13 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
         || context.stake_pool.sol_deposit_authority.is_some()
         || context.stake_pool.total_lamports == 0
         || context.stake_pool.pool_token_supply == 0
+        || spl_stake_pool::find_withdraw_authority_program_address(
+            &stake_pool_program_id(),
+            &stake_pool_address(),
+        ) != (
+            context.stake_pool.withdraw_authority,
+            context.stake_pool.withdraw_bump_seed,
+        )
     {
         bail!("invalid stake pool relationships");
     }
@@ -373,6 +453,7 @@ pub fn pay_invoice_instruction(
 mod tests {
     use super::*;
     use crate::invoice::{Invoice, find_invoice_address, invoicer_address};
+    use solana_stake_interface::state::{Authorized, Lockup, Meta, StakeStateV2};
 
     fn invoice(epoch: u64, amount: u64, outstanding: u64) -> Invoice {
         let vote = Pubkey::new_from_array([9; 32]);
@@ -387,7 +468,15 @@ mod tests {
     }
 
     fn pool() -> ValidatedStakePool {
+        let (withdraw_authority, withdraw_bump_seed) =
+            spl_stake_pool::find_withdraw_authority_program_address(
+                &stake_pool_program_id(),
+                &stake_pool_address(),
+            );
         ValidatedStakePool {
+            manager: Pubkey::new_unique(),
+            withdraw_authority,
+            withdraw_bump_seed,
             reserve_stake: Pubkey::new_unique(),
             pool_mint: vsol_mint(),
             manager_fee_account: Pubkey::new_unique(),
@@ -532,6 +621,98 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_malformed_stake_pool_deposit_accounts() {
+        let pool = pool();
+        let mint = ChainAccount {
+            owner: token_program_id(),
+            data: mint_data(pool.withdraw_authority, pool.pool_token_supply),
+        };
+        let mut reserve_data = bincode::serialize(&StakeStateV2::Initialized(Meta {
+            rent_exempt_reserve: 1,
+            authorized: Authorized::auto(&pool.withdraw_authority),
+            lockup: Lockup::default(),
+        }))
+        .unwrap();
+        reserve_data.resize(200, 0);
+        let reserve = ChainAccount {
+            owner: solana_stake_interface::program::id(),
+            data: reserve_data,
+        };
+        let manager_fee = ChainAccount {
+            owner: token_program_id(),
+            data: token_account_data(vsol_mint(), pool.manager, 0),
+        };
+        validate_deposit_accounts(&pool, &mint, &reserve, &manager_fee).expect("valid accounts");
+
+        let mut bad_mint = mint.clone();
+        bad_mint.data[4..36].copy_from_slice(Pubkey::new_unique().as_ref());
+        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+        let mut bad_mint = mint.clone();
+        bad_mint.data[36..44].copy_from_slice(&9_999_u64.to_le_bytes());
+        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+        let mut bad_mint = mint.clone();
+        bad_mint.data[46..50].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(validate_deposit_accounts(&pool, &bad_mint, &reserve, &manager_fee).is_err());
+
+        let mut bad_reserve = reserve.clone();
+        bad_reserve.owner = Pubkey::new_unique();
+        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+        let mut bad_reserve = reserve.clone();
+        bad_reserve.data = bincode::serialize(&StakeStateV2::Uninitialized).unwrap();
+        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+        let mut bad_reserve = reserve.clone();
+        bad_reserve.data = bincode::serialize(&StakeStateV2::Initialized(Meta {
+            rent_exempt_reserve: 1,
+            authorized: Authorized::auto(&Pubkey::new_unique()),
+            lockup: Lockup::default(),
+        }))
+        .unwrap();
+        assert!(validate_deposit_accounts(&pool, &mint, &bad_reserve, &manager_fee).is_err());
+
+        let mut bad_fee = manager_fee.clone();
+        bad_fee.data[32..64].copy_from_slice(Pubkey::new_unique().as_ref());
+        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+        let mut bad_fee = manager_fee.clone();
+        bad_fee.data[..32].copy_from_slice(Pubkey::new_unique().as_ref());
+        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+        let mut bad_fee = manager_fee;
+        bad_fee.owner = Pubkey::new_unique();
+        assert!(validate_deposit_accounts(&pool, &mint, &reserve, &bad_fee).is_err());
+    }
+
+    #[test]
+    fn stake_pool_decode_rejects_wrong_withdraw_bump() {
+        let raw = StakePool {
+            account_type: AccountType::StakePool,
+            manager: Pubkey::new_unique(),
+            reserve_stake: Pubkey::new_unique(),
+            pool_mint: vsol_mint(),
+            manager_fee_account: Pubkey::new_unique(),
+            token_program_id: token_program_id(),
+            total_lamports: 1,
+            pool_token_supply: 1,
+            last_update_epoch: 780,
+            stake_withdraw_bump_seed: pool().withdraw_bump_seed.wrapping_add(1),
+            ..StakePool::default()
+        };
+        let account = ChainAccount {
+            owner: stake_pool_program_id(),
+            data: borsh::to_vec(&raw).unwrap(),
+        };
+        assert!(decode_stake_pool(&account, 780).is_err());
+    }
+
+    fn mint_data(authority: Pubkey, supply: u64) -> Vec<u8> {
+        let mut data = vec![0; 82];
+        data[..4].copy_from_slice(&1_u32.to_le_bytes());
+        data[4..36].copy_from_slice(authority.as_ref());
+        data[36..44].copy_from_slice(&supply.to_le_bytes());
+        data[44] = 9;
+        data[45] = 1;
+        data
     }
 
     fn token_account_data(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {

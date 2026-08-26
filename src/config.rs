@@ -20,6 +20,7 @@ pub struct Config {
     pub max_total_vsol: u64,
     pub min_sol_reserve_lamports: u64,
     pub max_invoices: usize,
+    pub max_attempts: usize,
     pub priority_fee_micro_lamports: u64,
     pub deposit_slippage_bps: u16,
     pub transaction_fee_buffer_lamports: u64,
@@ -39,6 +40,8 @@ struct RawConfig {
     min_sol_reserve_lamports: u64,
     #[serde(default = "default_max_invoices")]
     max_invoices: usize,
+    #[serde(default = "default_max_attempts")]
+    max_attempts: usize,
     #[serde(default = "default_priority_fee")]
     priority_fee_micro_lamports: u64,
     #[serde(default = "default_slippage_bps")]
@@ -59,6 +62,10 @@ const fn default_max_invoices() -> usize {
     6
 }
 
+const fn default_max_attempts() -> usize {
+    3
+}
+
 const fn default_priority_fee() -> u64 {
     1_000
 }
@@ -72,6 +79,15 @@ const fn default_fee_buffer() -> u64 {
 }
 
 impl Config {
+    pub fn metrics_path_hint(path: impl AsRef<Path>) -> Option<PathBuf> {
+        let raw = fs::read_to_string(path).ok()?;
+        toml::from_str::<toml::Value>(&raw)
+            .ok()?
+            .get("metrics_path")?
+            .as_str()
+            .map(PathBuf::from)
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)
@@ -87,6 +103,7 @@ impl Config {
             max_total_vsol: raw.max_total_vsol,
             min_sol_reserve_lamports: raw.min_sol_reserve_lamports,
             max_invoices: raw.max_invoices,
+            max_attempts: raw.max_attempts,
             priority_fee_micro_lamports: raw.priority_fee_micro_lamports,
             deposit_slippage_bps: raw.deposit_slippage_bps,
             transaction_fee_buffer_lamports: raw.transaction_fee_buffer_lamports,
@@ -114,6 +131,9 @@ impl Config {
         if self.max_invoices == 0 || self.max_invoices > 6 {
             bail!("max_invoices must be in 1..=6");
         }
+        if self.max_attempts == 0 || self.max_attempts > 3 {
+            bail!("max_attempts must be in 1..=3");
+        }
         if self.deposit_slippage_bps > 1_000 {
             bail!("deposit_slippage_bps must be at most 1000");
         }
@@ -121,10 +141,13 @@ impl Config {
             .checked_mul(1_400_000)
             .ok_or_else(|| anyhow::anyhow!("priority fee overflow"))?
             .div_ceil(1_000_000);
-        let minimum_fee_buffer = u64::try_from(priority_fee_lamports)
+        let per_attempt_fee_buffer = u64::try_from(priority_fee_lamports)
             .ok()
             .and_then(|fee| fee.checked_add(10_000))
             .ok_or_else(|| anyhow::anyhow!("priority fee overflow"))?;
+        let minimum_fee_buffer = per_attempt_fee_buffer
+            .checked_mul(u64::try_from(self.max_attempts)?)
+            .ok_or_else(|| anyhow::anyhow!("retry fee reserve overflow"))?;
         if self.transaction_fee_buffer_lamports < minimum_fee_buffer {
             bail!(
                 "transaction_fee_buffer_lamports must be at least {minimum_fee_buffer} for the configured priority fee"
@@ -159,6 +182,7 @@ metrics_path = "/var/lib/node-exporter/vsol-bond.prom"
         assert_eq!(config.max_total_vsol, HARD_MAX_TOTAL_VSOL);
         assert_eq!(config.min_sol_reserve_lamports, 100_000_000);
         assert_eq!(config.max_invoices, 6);
+        assert_eq!(config.max_attempts, 3);
         assert!(config.priority_fee_micro_lamports > 0);
     }
 
@@ -198,5 +222,15 @@ metrics_path = "/var/lib/node-exporter/vsol-bond.prom"
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn fee_buffer_covers_all_configured_attempts() {
+        let too_small = format!(
+            "{VALID}\nmax_attempts = 3\npriority_fee_micro_lamports = 1000\ntransaction_fee_buffer_lamports = 34199\n"
+        );
+        assert!(load(&too_small).is_err());
+        let exact = too_small.replace("34199", "34200");
+        assert!(load(&exact).is_ok());
     }
 }

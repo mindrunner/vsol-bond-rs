@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
 use solana_instruction::Instruction;
@@ -7,6 +8,7 @@ use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use std::{thread, time::Duration};
 
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 const MIN_COMPUTE_UNIT_LIMIT: u32 = 1_000;
@@ -41,10 +43,18 @@ pub struct SimulationResult {
     pub logs: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Confirmed,
+    Failed(String),
+    ExpiredNotFound,
+}
+
 pub trait SubmissionBackend {
     fn latest_blockhash(&self) -> Result<Hash>;
     fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult>;
-    fn send_and_confirm(&self, transaction: &Transaction) -> Result<Signature>;
+    fn send(&self, transaction: &Transaction) -> Result<Signature>;
+    fn reconcile(&self, signature: &Signature, blockhash: &Hash) -> Result<ReconcileOutcome>;
 }
 
 impl SubmissionBackend for RpcClient {
@@ -65,9 +75,46 @@ impl SubmissionBackend for RpcClient {
         })
     }
 
-    fn send_and_confirm(&self, transaction: &Transaction) -> Result<Signature> {
-        self.send_and_confirm_transaction(transaction)
-            .context("failed to send and confirm transaction")
+    fn send(&self, transaction: &Transaction) -> Result<Signature> {
+        self.send_transaction(transaction)
+            .context("failed to send transaction")
+    }
+
+    fn reconcile(&self, signature: &Signature, blockhash: &Hash) -> Result<ReconcileOutcome> {
+        let confirmed = CommitmentConfig::confirmed();
+        loop {
+            let status = self
+                .get_signature_statuses(&[*signature])
+                .context("failed to query transaction status")?
+                .value
+                .into_iter()
+                .next()
+                .flatten();
+            if let Some(status) = status {
+                if let Some(error) = status.err {
+                    return Ok(ReconcileOutcome::Failed(error.to_string()));
+                }
+                if status.satisfies_commitment(confirmed) {
+                    return Ok(ReconcileOutcome::Confirmed);
+                }
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            if !self
+                .is_blockhash_valid(blockhash, CommitmentConfig::processed())
+                .context("failed to check blockhash validity")?
+            {
+                let final_status = self
+                    .get_signature_status_with_commitment_and_history(signature, confirmed, true)
+                    .context("failed final transaction status reconciliation")?;
+                return match final_status {
+                    Some(Ok(())) => Ok(ReconcileOutcome::Confirmed),
+                    Some(Err(error)) => Ok(ReconcileOutcome::Failed(error.to_string())),
+                    None => Ok(ReconcileOutcome::ExpiredNotFound),
+                };
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
     }
 }
 
@@ -164,12 +211,28 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             &[payer],
             blockhash,
         );
-        match backend.send_and_confirm(&transaction) {
-            Ok(signature) => return Ok(signature),
-            Err(error) => {
-                let retryable = is_retryable_error(&error.to_string());
-                last_error = Some(error);
-                if !retryable || attempt + 1 == max_attempts {
+        let local_signature = *transaction
+            .signatures
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("signed transaction has no signature"))?;
+        match backend.send(&transaction) {
+            Ok(returned_signature) if returned_signature != local_signature => {
+                bail!("RPC returned a transaction signature mismatch");
+            }
+            Ok(_) => {}
+            Err(error) if is_retryable_error(&error.to_string()) => {}
+            Err(error) => return Err(error),
+        }
+        match backend.reconcile(&local_signature, &blockhash)? {
+            ReconcileOutcome::Confirmed => return Ok(local_signature),
+            ReconcileOutcome::Failed(error) => {
+                bail!("transaction was confirmed with an error: {error}");
+            }
+            ReconcileOutcome::ExpiredNotFound => {
+                last_error = Some(anyhow::anyhow!(
+                    "transaction was not observed before blockhash expiry"
+                ));
+                if attempt + 1 == max_attempts {
                     break;
                 }
             }
@@ -211,10 +274,13 @@ mod tests {
 
     struct MockBackend {
         blockhashes: RefCell<VecDeque<Hash>>,
-        send_results: RefCell<VecDeque<anyhow::Result<Signature>>>,
+        send_results: RefCell<VecDeque<anyhow::Result<()>>>,
+        reconcile_results: RefCell<VecDeque<anyhow::Result<ReconcileOutcome>>>,
         latest_calls: RefCell<usize>,
         simulation_calls: RefCell<usize>,
         send_calls: RefCell<usize>,
+        reconcile_calls: RefCell<usize>,
+        sent_signatures: RefCell<Vec<Signature>>,
         simulation: SimulationResult,
     }
 
@@ -232,12 +298,28 @@ mod tests {
             Ok(self.simulation.clone())
         }
 
-        fn send_and_confirm(&self, _transaction: &Transaction) -> anyhow::Result<Signature> {
+        fn send(&self, transaction: &Transaction) -> anyhow::Result<Signature> {
             *self.send_calls.borrow_mut() += 1;
+            let signature = transaction.signatures[0];
+            self.sent_signatures.borrow_mut().push(signature);
             self.send_results
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow::anyhow!("no send result")))
+                .map(|()| signature)
+        }
+
+        fn reconcile(
+            &self,
+            signature: &Signature,
+            _blockhash: &Hash,
+        ) -> anyhow::Result<ReconcileOutcome> {
+            *self.reconcile_calls.borrow_mut() += 1;
+            assert_eq!(self.sent_signatures.borrow().last(), Some(signature));
+            self.reconcile_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("no reconcile result")))
         }
     }
 
@@ -261,11 +343,17 @@ mod tests {
             ])),
             send_results: RefCell::new(VecDeque::from([
                 Err(anyhow::anyhow!("block height exceeded")),
-                Ok(Signature::from([3; 64])),
+                Ok(()),
+            ])),
+            reconcile_results: RefCell::new(VecDeque::from([
+                Ok(ReconcileOutcome::ExpiredNotFound),
+                Ok(ReconcileOutcome::Confirmed),
             ])),
             latest_calls: RefCell::new(0),
             simulation_calls: RefCell::new(0),
             send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
@@ -275,10 +363,11 @@ mod tests {
         let payer = Keypair::new();
         let signature =
             submit_with_backend(&backend, &payer, &[instruction()], 1_000, 3).expect("success");
-        assert_eq!(signature, Signature::from([3; 64]));
+        assert_eq!(signature, backend.sent_signatures.borrow()[1]);
         assert_eq!(*backend.latest_calls.borrow(), 2);
         assert_eq!(*backend.simulation_calls.borrow(), 2);
         assert_eq!(*backend.send_calls.borrow(), 2);
+        assert_eq!(*backend.reconcile_calls.borrow(), 2);
     }
 
     #[test]
@@ -293,9 +382,12 @@ mod tests {
         let backend = MockBackend {
             blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
             send_results: RefCell::new(VecDeque::new()),
+            reconcile_results: RefCell::new(VecDeque::new()),
             latest_calls: RefCell::new(0),
             simulation_calls: RefCell::new(0),
             send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
             simulation: SimulationResult {
                 units_consumed: Some(50_000),
                 error: Some("custom program error: 0x1770".into()),
@@ -324,9 +416,16 @@ mod tests {
                 Err(anyhow::anyhow!("timeout")),
                 Err(anyhow::anyhow!("timeout")),
             ])),
+            reconcile_results: RefCell::new(VecDeque::from([
+                Ok(ReconcileOutcome::ExpiredNotFound),
+                Ok(ReconcileOutcome::ExpiredNotFound),
+                Ok(ReconcileOutcome::ExpiredNotFound),
+            ])),
             latest_calls: RefCell::new(0),
             simulation_calls: RefCell::new(0),
             send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
             simulation: SimulationResult {
                 units_consumed: None,
                 error: None,
@@ -335,5 +434,29 @@ mod tests {
         };
         assert!(submit_with_backend(&backend, &Keypair::new(), &[instruction()], 0, 3).is_err());
         assert_eq!(*backend.send_calls.borrow(), 3);
+    }
+
+    #[test]
+    fn ambiguous_timeout_returns_observed_success_without_resending() {
+        let backend = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
+            send_results: RefCell::new(VecDeque::from([Err(anyhow::anyhow!("request timed out"))])),
+            reconcile_results: RefCell::new(VecDeque::from([Ok(ReconcileOutcome::Confirmed)])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        let signature = submit_with_backend(&backend, &Keypair::new(), &[instruction()], 1_000, 3)
+            .expect("observed transaction must succeed");
+        assert_eq!(signature, backend.sent_signatures.borrow()[0]);
+        assert_eq!(*backend.send_calls.borrow(), 1);
+        assert_eq!(*backend.reconcile_calls.borrow(), 1);
     }
 }
