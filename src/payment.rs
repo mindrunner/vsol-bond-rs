@@ -117,7 +117,10 @@ pub fn decode_stake_pool(account: &ChainAccount, current_epoch: u64) -> Result<V
     if account.owner != stake_pool_program_id() {
         bail!("stake pool has foreign owner");
     }
-    let pool = StakePool::try_from_slice(&account.data)
+    // Stake pool accounts are allocated larger than their borsh payload, so
+    // trailing bytes must be tolerated (SPL's try_from_slice_unchecked
+    // semantics); try_from_slice would reject every real account.
+    let pool = StakePool::deserialize(&mut account.data.as_slice())
         .map_err(|error| anyhow::anyhow!("invalid stake pool data: {error}"))?;
     let (withdraw_authority, withdraw_bump_seed) =
         spl_stake_pool::find_withdraw_authority_program_address(
@@ -791,6 +794,26 @@ mod tests {
             &manager_fee,
         )
         .expect("SPL Stake Pool permits a distinct fee token authority");
+    }
+
+    #[test]
+    fn decodes_real_mainnet_stake_pool_account_bytes() {
+        // Captured verbatim from mainnet account
+        // Fu9BYC6tWBo1KMKaP3CFoKfRhqv9akmy3DuYwnCyWiyC (611 bytes: borsh
+        // payload plus allocation padding, which on-chain readers must
+        // tolerate like SPL's try_from_slice_unchecked does).
+        let data = include_bytes!("../tests/fixtures/mainnet_stake_pool.bin").to_vec();
+        let last_update_epoch = u64::from_le_bytes(data[274..282].try_into().unwrap());
+        let account = ChainAccount {
+            owner: stake_pool_program_id(),
+            data,
+        };
+        let decoded = decode_stake_pool(&account, last_update_epoch)
+            .expect("real mainnet stake pool account");
+        assert_eq!(decoded.pool_mint, vsol_mint());
+        assert_eq!(decoded.token_program_id, token_program_id());
+        assert!(decoded.total_lamports > 0 && decoded.pool_token_supply > 0);
+        assert_eq!(decoded.sol_deposit_authority, None);
     }
 
     #[test]
