@@ -93,6 +93,7 @@ impl ChainDataSource for RpcChainDataSource<'_> {
             &stake_pool,
             &mint_account,
             &deposit_account(0, "reserve stake")?,
+            stake_pool.manager_fee_account,
             &deposit_account(1, "manager fee")?,
         )?;
         let (source_ata_exists, existing_vsol) = match accounts[3].as_ref() {
