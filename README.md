@@ -18,13 +18,15 @@ most six outstanding invoices before any signing is possible.
   original amount.
 - The hard payment cap is 5,000,000,000 vSOL base units (5 vSOL). It cannot be
   raised in configuration.
-- The payer retains at least 100,000,000 lamports plus the configured
-  transaction-fee buffer.
+- The payer retains at least 100,000,000 lamports plus a transaction-fee
+  buffer sized for every configured attempt.
 - Existing vSOL in the payer ATA is used first; only the shortfall is deposited.
 - Transactions are simulated before signing for submission. The compute limit
   is simulated usage plus 20%, clamped to 1,000..1,400,000 units.
-- Submission retries are limited to three fresh blockhashes and only transient
-  transport/blockhash failures are retried. Program and simulation errors,
+- Submission retries are limited to three fresh blockhashes. Before using a
+  new blockhash, the bot reconciles the locally derived signature through the
+  prior blockhash's expiry and performs a final history lookup, so an ambiguous
+  timeout cannot duplicate a landed payment. Program and simulation errors,
   including logs, are returned immediately.
 
 The pinned stake-pool revision supports `deposit_sol_with_slippage`. The bot
@@ -32,6 +34,9 @@ quotes enough SOL for the required net vSOL after the on-chain SOL-deposit fee,
 adds the configured SOL input buffer, and sets the minimum pool-token output to
 the exact vSOL shortfall. The stake pool must be current for the cluster epoch
 and must not require a separate SOL deposit authority.
+The pool program owner, withdraw-authority PDA and bump, reserve stake state,
+pool mint authority/supply/freeze state, manager fee token account, token
+program, and configured vSOL mint are all validated before planning a deposit.
 
 ## Configuration
 
@@ -46,6 +51,7 @@ metrics_path = "/var/lib/node_exporter/textfile_collector/vsol-bond.prom"
 max_total_vsol = 5000000000
 min_sol_reserve_lamports = 100000000
 max_invoices = 6
+max_attempts = 3
 priority_fee_micro_lamports = 1000
 deposit_slippage_bps = 50
 transaction_fee_buffer_lamports = 1000000
@@ -68,7 +74,11 @@ The application never prints keypair contents or serialized signed transactions.
 
 ## Metrics
 
-The Prometheus textfile is replaced atomically on success and failure. It
+The metrics destination is write-preflighted before payment, and the
+Prometheus textfile is replaced atomically on success and failure. Operational
+errors remain the primary error even if failure metrics cannot be written. If
+an on-chain payment succeeds but its metrics update fails, the CLI reports that
+the payment was confirmed and identifies the metrics failure. The file
 contains last-run timestamp/success/phase, discovered and paid invoice counts,
 outstanding vSOL, deposited SOL, and observed payer SOL/vSOL balances.
 Transaction signatures are never metric labels.

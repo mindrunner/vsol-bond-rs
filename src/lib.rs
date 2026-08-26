@@ -12,7 +12,8 @@ use invoice::{
 };
 use payment::{
     PaymentContext, PaymentLimits, PaymentPlan, associated_token_address, build_payment_plan,
-    decode_stake_pool, stake_pool_address, validate_token_account, validate_vsol_mint, vsol_mint,
+    decode_stake_pool, stake_pool_address, validate_deposit_accounts, validate_token_account,
+    vsol_mint,
 };
 use solana_client::rpc_client::RpcClient;
 use solana_signature::Signature;
@@ -70,8 +71,30 @@ impl ChainDataSource for RpcChainDataSource<'_> {
         if invoicer.vsol_reserves != expected_reserves {
             bail!("invoicer reserves do not match its vSOL ATA");
         }
-        validate_vsol_mint(&account(1, "vSOL mint")?)?;
+        let mint_account = account(1, "vSOL mint")?;
         let stake_pool = decode_stake_pool(&account(2, "stake pool")?, current_epoch)?;
+        let deposit_accounts = self
+            .client
+            .get_multiple_accounts(&[stake_pool.reserve_stake, stake_pool.manager_fee_account])
+            .context("failed to fetch stake-pool deposit accounts")?;
+        if deposit_accounts.len() != 2 {
+            bail!("RPC returned an unexpected stake-pool account count");
+        }
+        let deposit_account = |index: usize, name: &str| -> Result<ChainAccount> {
+            let value = deposit_accounts[index]
+                .as_ref()
+                .with_context(|| format!("missing {name} account"))?;
+            Ok(ChainAccount {
+                owner: value.owner,
+                data: value.data.clone(),
+            })
+        };
+        validate_deposit_accounts(
+            &stake_pool,
+            &mint_account,
+            &deposit_account(0, "reserve stake")?,
+            &deposit_account(1, "manager fee")?,
+        )?;
         let (source_ata_exists, existing_vsol) = match accounts[3].as_ref() {
             Some(value) => {
                 let account = ChainAccount {
@@ -172,13 +195,10 @@ mod tests {
             PaymentContext, ValidatedStakePool, associated_token_address, token_program_id,
             vsol_mint,
         },
-        transaction::TxSubmitter,
     };
     use anyhow::Result;
-    use solana_instruction::Instruction;
     use solana_pubkey::Pubkey;
-    use solana_signature::Signature;
-    use std::{cell::Cell, path::PathBuf};
+    use std::path::PathBuf;
 
     struct StaticSource;
 
@@ -202,6 +222,17 @@ mod tests {
                 }],
                 invoicer_reserves: associated_token_address(&invoicer_address(), &vsol_mint()),
                 stake_pool: ValidatedStakePool {
+                    manager: Pubkey::new_unique(),
+                    withdraw_authority: spl_stake_pool::find_withdraw_authority_program_address(
+                        &crate::payment::stake_pool_program_id(),
+                        &crate::payment::stake_pool_address(),
+                    )
+                    .0,
+                    withdraw_bump_seed: spl_stake_pool::find_withdraw_authority_program_address(
+                        &crate::payment::stake_pool_program_id(),
+                        &crate::payment::stake_pool_address(),
+                    )
+                    .1,
                     reserve_stake: Pubkey::new_unique(),
                     pool_mint: vsol_mint(),
                     manager_fee_account: Pubkey::new_unique(),
@@ -216,18 +247,8 @@ mod tests {
         }
     }
 
-    struct RecordingSubmitter(Cell<usize>);
-
-    impl TxSubmitter for RecordingSubmitter {
-        fn submit(&self, _instructions: &[Instruction]) -> Result<Signature> {
-            self.0.set(self.0.get() + 1);
-            Ok(Signature::from([1; 64]))
-        }
-    }
-
     #[test]
-    fn plan_never_calls_submit() {
-        let submitter = RecordingSubmitter(Cell::new(0));
+    fn pure_planner_builds_without_a_submission_dependency() {
         let config = Config {
             rpc_url: "https://rpc.example.test".into(),
             vote_account: Pubkey::new_unique(),
@@ -237,12 +258,12 @@ mod tests {
             max_total_vsol: 5_000_000_000,
             min_sol_reserve_lamports: 100_000_000,
             max_invoices: 6,
+            max_attempts: 3,
             priority_fee_micro_lamports: 1_000,
             deposit_slippage_bps: 50,
             transaction_fee_buffer_lamports: 1_000_000,
         };
         let plan = plan(&StaticSource, &config).expect("plan");
         assert_eq!(plan.total_outstanding_vsol, 1);
-        assert_eq!(submitter.0.get(), 0);
     }
 }
