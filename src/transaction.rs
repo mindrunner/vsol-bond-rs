@@ -45,6 +45,12 @@ pub struct SimulationResult {
     pub logs: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockhashContext {
+    pub blockhash: Hash,
+    pub last_valid_block_height: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconcileOutcome {
     Confirmed,
@@ -63,21 +69,31 @@ enum ObservedStatus {
 trait ReconciliationBackend {
     fn signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>>;
     fn blockhash_valid(&self, blockhash: &Hash) -> Result<bool>;
+    fn current_block_height(&self) -> Result<u64>;
     fn final_signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>>;
     fn wait_before_poll(&self);
 }
 
 pub trait SubmissionBackend {
-    fn latest_blockhash(&self) -> Result<Hash>;
+    fn latest_blockhash(&self) -> Result<BlockhashContext>;
     fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult>;
     fn send(&self, transaction: &Transaction) -> Result<Signature>;
-    fn reconcile(&self, signature: &Signature, blockhash: &Hash) -> Result<ReconcileOutcome>;
+    fn reconcile(
+        &self,
+        signature: &Signature,
+        blockhash: &BlockhashContext,
+    ) -> Result<ReconcileOutcome>;
 }
 
 impl SubmissionBackend for RpcClient {
-    fn latest_blockhash(&self) -> Result<Hash> {
-        self.get_latest_blockhash()
-            .context("failed to obtain latest blockhash")
+    fn latest_blockhash(&self) -> Result<BlockhashContext> {
+        let (blockhash, last_valid_block_height) = self
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .context("failed to obtain latest blockhash")?;
+        Ok(BlockhashContext {
+            blockhash,
+            last_valid_block_height,
+        })
     }
 
     fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult> {
@@ -97,7 +113,11 @@ impl SubmissionBackend for RpcClient {
             .context("failed to send transaction")
     }
 
-    fn reconcile(&self, signature: &Signature, blockhash: &Hash) -> Result<ReconcileOutcome> {
+    fn reconcile(
+        &self,
+        signature: &Signature,
+        blockhash: &BlockhashContext,
+    ) -> Result<ReconcileOutcome> {
         reconcile_with_backend(self, signature, blockhash, MAX_RECONCILIATION_POLLS)
     }
 }
@@ -127,6 +147,11 @@ impl ReconciliationBackend for RpcClient {
             .context("failed to check blockhash validity")
     }
 
+    fn current_block_height(&self) -> Result<u64> {
+        self.get_block_height_with_commitment(CommitmentConfig::confirmed())
+            .context("failed to query current block height")
+    }
+
     fn final_signature_status(&self, signature: &Signature) -> Result<Option<ObservedStatus>> {
         Ok(self
             .get_signature_status_with_commitment_and_history(
@@ -149,7 +174,7 @@ impl ReconciliationBackend for RpcClient {
 fn reconcile_with_backend<B: ReconciliationBackend>(
     backend: &B,
     signature: &Signature,
-    blockhash: &Hash,
+    blockhash: &BlockhashContext,
     max_polls: usize,
 ) -> Result<ReconcileOutcome> {
     if max_polls == 0 {
@@ -174,7 +199,7 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
             Err(error) => return Err(error),
         }
 
-        let blockhash_valid = match backend.blockhash_valid(blockhash) {
+        let blockhash_valid = match backend.blockhash_valid(&blockhash.blockhash) {
             Ok(valid) => valid,
             Err(error) if is_retryable_anyhow(&error) => {
                 uncertain_read = true;
@@ -188,7 +213,21 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
             Err(error) => return Err(error),
         };
 
-        if !blockhash_valid {
+        let current_block_height = match backend.current_block_height() {
+            Ok(height) => height,
+            Err(error) if is_retryable_anyhow(&error) => {
+                uncertain_read = true;
+                last_transient_error = Some(error.to_string());
+                if poll + 1 < max_polls {
+                    backend.wait_before_poll();
+                    continue;
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if !blockhash_valid && current_block_height > blockhash.last_valid_block_height {
             match backend.final_signature_status(signature) {
                 Ok(Some(ObservedStatus::Confirmed)) => return Ok(ReconcileOutcome::Confirmed),
                 Ok(Some(ObservedStatus::Failed(error))) => {
@@ -280,7 +319,7 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             &simulation_instructions,
             Some(&payer.pubkey()),
             &[payer],
-            blockhash,
+            blockhash.blockhash,
         );
         let simulation = match backend.simulate(&simulation_transaction) {
             Ok(simulation) => simulation,
@@ -311,7 +350,7 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             &final_instructions,
             Some(&payer.pubkey()),
             &[payer],
-            blockhash,
+            blockhash.blockhash,
         );
         let local_signature = *transaction
             .signatures
@@ -384,7 +423,7 @@ mod tests {
     use std::{cell::RefCell, collections::VecDeque};
 
     struct MockBackend {
-        blockhashes: RefCell<VecDeque<Hash>>,
+        blockhashes: RefCell<VecDeque<BlockhashContext>>,
         send_results: RefCell<VecDeque<anyhow::Result<()>>>,
         reconcile_results: RefCell<VecDeque<anyhow::Result<ReconcileOutcome>>>,
         latest_calls: RefCell<usize>,
@@ -396,7 +435,7 @@ mod tests {
     }
 
     impl SubmissionBackend for MockBackend {
-        fn latest_blockhash(&self) -> anyhow::Result<Hash> {
+        fn latest_blockhash(&self) -> anyhow::Result<BlockhashContext> {
             *self.latest_calls.borrow_mut() += 1;
             self.blockhashes
                 .borrow_mut()
@@ -423,7 +462,7 @@ mod tests {
         fn reconcile(
             &self,
             signature: &Signature,
-            _blockhash: &Hash,
+            _blockhash: &BlockhashContext,
         ) -> anyhow::Result<ReconcileOutcome> {
             *self.reconcile_calls.borrow_mut() += 1;
             assert_eq!(self.sent_signatures.borrow().last(), Some(signature));
@@ -438,6 +477,13 @@ mod tests {
         Instruction::new_with_bytes(Pubkey::new_unique(), &[], vec![])
     }
 
+    fn blockhash(byte: u8) -> BlockhashContext {
+        BlockhashContext {
+            blockhash: Hash::new_from_array([byte; 32]),
+            last_valid_block_height: 100,
+        }
+    }
+
     #[test]
     fn compute_math_applies_twenty_percent_and_clamps() {
         assert_eq!(compute_unit_limit_with_margin(166_000), 199_200);
@@ -448,10 +494,7 @@ mod tests {
     #[test]
     fn retries_transient_errors_with_fresh_blockhash_and_stops_at_success() {
         let backend = MockBackend {
-            blockhashes: RefCell::new(VecDeque::from([
-                Hash::new_from_array([1; 32]),
-                Hash::new_from_array([2; 32]),
-            ])),
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1), blockhash(2)])),
             send_results: RefCell::new(VecDeque::from([
                 Err(anyhow::anyhow!("block height exceeded")),
                 Ok(()),
@@ -491,7 +534,7 @@ mod tests {
         assert!(is_retryable_error("request timed out"));
 
         let backend = MockBackend {
-            blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1)])),
             send_results: RefCell::new(VecDeque::new()),
             reconcile_results: RefCell::new(VecDeque::new()),
             latest_calls: RefCell::new(0),
@@ -517,11 +560,7 @@ mod tests {
     #[test]
     fn retry_count_is_bounded() {
         let backend = MockBackend {
-            blockhashes: RefCell::new(VecDeque::from([
-                Hash::new_from_array([1; 32]),
-                Hash::new_from_array([2; 32]),
-                Hash::new_from_array([3; 32]),
-            ])),
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1), blockhash(2), blockhash(3)])),
             send_results: RefCell::new(VecDeque::from([
                 Err(anyhow::anyhow!("timeout")),
                 Err(anyhow::anyhow!("timeout")),
@@ -550,7 +589,7 @@ mod tests {
     #[test]
     fn ambiguous_timeout_returns_observed_success_without_resending() {
         let backend = MockBackend {
-            blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1)])),
             send_results: RefCell::new(VecDeque::from([Err(anyhow::anyhow!("request timed out"))])),
             reconcile_results: RefCell::new(VecDeque::from([Ok(ReconcileOutcome::Confirmed)])),
             latest_calls: RefCell::new(0),
@@ -574,8 +613,10 @@ mod tests {
     struct ReconciliationMock {
         statuses: RefCell<VecDeque<anyhow::Result<Option<ObservedStatus>>>>,
         validities: RefCell<VecDeque<anyhow::Result<bool>>>,
+        block_heights: RefCell<VecDeque<anyhow::Result<u64>>>,
         final_statuses: RefCell<VecDeque<anyhow::Result<Option<ObservedStatus>>>>,
         validity_calls: RefCell<usize>,
+        block_height_calls: RefCell<usize>,
     }
 
     impl ReconciliationBackend for ReconciliationMock {
@@ -589,6 +630,11 @@ mod tests {
         fn blockhash_valid(&self, _blockhash: &Hash) -> anyhow::Result<bool> {
             *self.validity_calls.borrow_mut() += 1;
             self.validities.borrow_mut().pop_front().unwrap()
+        }
+
+        fn current_block_height(&self) -> anyhow::Result<u64> {
+            *self.block_height_calls.borrow_mut() += 1;
+            self.block_heights.borrow_mut().pop_front().unwrap()
         }
 
         fn final_signature_status(
@@ -613,13 +659,18 @@ mod tests {
                 Err(anyhow::anyhow!("node temporarily unavailable").context("blockhash RPC failed")),
                 Ok(true),
             ])),
+            block_heights: RefCell::new(VecDeque::from([Ok(50), Ok(51)])),
             final_statuses: RefCell::new(VecDeque::new()),
             validity_calls: RefCell::new(0),
+            block_height_calls: RefCell::new(0),
         };
         let outcome = reconcile_with_backend(
             &backend,
             &Signature::from([8; 64]),
-            &Hash::new_from_array([7; 32]),
+            &BlockhashContext {
+                blockhash: Hash::new_from_array([7; 32]),
+                last_valid_block_height: 100,
+            },
             4,
         )
         .expect("transient reads recover");
@@ -636,13 +687,18 @@ mod tests {
                 Ok(Some(ObservedStatus::Processed)),
             ])),
             validities: RefCell::new(VecDeque::from([Ok(false), Ok(false), Ok(false)])),
+            block_heights: RefCell::new(VecDeque::from([Ok(101), Ok(102), Ok(103)])),
             final_statuses: RefCell::new(VecDeque::from([Ok(None), Ok(None), Ok(None)])),
             validity_calls: RefCell::new(0),
+            block_height_calls: RefCell::new(0),
         };
         let outcome = reconcile_with_backend(
             &backend,
             &Signature::from([8; 64]),
-            &Hash::new_from_array([7; 32]),
+            &BlockhashContext {
+                blockhash: Hash::new_from_array([7; 32]),
+                last_valid_block_height: 100,
+            },
             3,
         )
         .expect("bounded reconciliation");
@@ -651,9 +707,102 @@ mod tests {
     }
 
     #[test]
+    fn false_blockhash_validity_before_expiry_cannot_authorize_retry() {
+        let backend = ReconciliationMock {
+            statuses: RefCell::new(VecDeque::from([Ok(None), Ok(None), Ok(None)])),
+            validities: RefCell::new(VecDeque::from([Ok(false), Ok(false), Ok(false)])),
+            block_heights: RefCell::new(VecDeque::from([Ok(98), Ok(99), Ok(100)])),
+            final_statuses: RefCell::new(VecDeque::new()),
+            validity_calls: RefCell::new(0),
+            block_height_calls: RefCell::new(0),
+        };
+        let outcome = reconcile_with_backend(
+            &backend,
+            &Signature::from([8; 64]),
+            &BlockhashContext {
+                blockhash: Hash::new_from_array([7; 32]),
+                last_valid_block_height: 100,
+            },
+            3,
+        )
+        .expect("bounded reconciliation");
+        assert!(matches!(&outcome, ReconcileOutcome::Unresolved(_)));
+        assert_eq!(*backend.block_height_calls.borrow(), 3);
+
+        let submission = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1), blockhash(2)])),
+            send_results: RefCell::new(VecDeque::from([
+                Err(anyhow::anyhow!("request timed out")),
+                Ok(()),
+            ])),
+            reconcile_results: RefCell::new(VecDeque::from([Ok(outcome)])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        assert!(submit_with_backend(&submission, &Keypair::new(), &[instruction()], 0, 3).is_err());
+        assert_eq!(*submission.send_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn proven_expiry_and_final_history_miss_authorize_retry() {
+        let backend = ReconciliationMock {
+            statuses: RefCell::new(VecDeque::from([Ok(None)])),
+            validities: RefCell::new(VecDeque::from([Ok(false)])),
+            block_heights: RefCell::new(VecDeque::from([Ok(101)])),
+            final_statuses: RefCell::new(VecDeque::from([Ok(None)])),
+            validity_calls: RefCell::new(0),
+            block_height_calls: RefCell::new(0),
+        };
+        let outcome = reconcile_with_backend(
+            &backend,
+            &Signature::from([8; 64]),
+            &BlockhashContext {
+                blockhash: Hash::new_from_array([7; 32]),
+                last_valid_block_height: 100,
+            },
+            3,
+        )
+        .expect("reconciliation");
+        assert_eq!(outcome, ReconcileOutcome::ExpiredNotFound);
+
+        let submission = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1), blockhash(2)])),
+            send_results: RefCell::new(VecDeque::from([
+                Err(anyhow::anyhow!("request timed out")),
+                Ok(()),
+            ])),
+            reconcile_results: RefCell::new(VecDeque::from([
+                Ok(outcome),
+                Ok(ReconcileOutcome::Confirmed),
+            ])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        submit_with_backend(&submission, &Keypair::new(), &[instruction()], 0, 3)
+            .expect("proven expiry permits one fresh-blockhash retry");
+        assert_eq!(*submission.send_calls.borrow(), 2);
+    }
+
+    #[test]
     fn unresolved_reconciliation_does_not_duplicate_submission() {
         let backend = MockBackend {
-            blockhashes: RefCell::new(VecDeque::from([Hash::new_from_array([1; 32])])),
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1)])),
             send_results: RefCell::new(VecDeque::from([Ok(())])),
             reconcile_results: RefCell::new(VecDeque::from([Ok(ReconcileOutcome::Unresolved(
                 "processed status did not settle".into(),

@@ -24,10 +24,11 @@ most six outstanding invoices before any signing is possible.
 - Transactions are simulated before signing for submission. The compute limit
   is simulated usage plus 20%, clamped to 1,000..1,400,000 units.
 - Submission retries are limited to three fresh blockhashes. Before using a
-  new blockhash, the bot reconciles the locally derived signature through the
-  prior blockhash's expiry and performs a final history lookup, so an ambiguous
-  timeout cannot duplicate a landed payment. Program and simulation errors,
-  including logs, are returned immediately.
+  new blockhash, the bot reconciles the locally derived signature, proves the
+  confirmed block height exceeded the stored last-valid height, and performs a
+  final history lookup. A false blockhash-validity response or uncertain RPC
+  read cannot duplicate an ambiguously landed payment. Program and simulation
+  errors, including logs, are returned immediately.
 
 The pinned stake-pool revision supports `deposit_sol_with_slippage`. The bot
 quotes enough SOL for the required net vSOL after the on-chain SOL-deposit fee,
