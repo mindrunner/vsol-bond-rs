@@ -75,7 +75,13 @@ fn run_with_sink<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
             error,
         ));
     }
-    let client = RpcClient::new(config.rpc_url.clone());
+    // The whole pipeline operates at confirmed commitment. The RpcClient
+    // default is finalized, which rejects confirmed blockhashes during
+    // simulation and preflight with "Blockhash not found".
+    let client = RpcClient::new_with_commitment(
+        config.rpc_url.clone(),
+        solana_commitment_config::CommitmentConfig::confirmed(),
+    );
     let source = RpcChainDataSource { client: &client };
     let planned = plan(&source, &config);
     let payment_plan = match planned {
@@ -445,9 +451,17 @@ mod tests {
     }
 
     fn start_plan_rpc_stub() -> PlanRpcFixture {
+        start_rpc_stub(None)
+    }
+
+    /// `payer_override` switches the stub into pay mode: current epoch 781,
+    /// one outstanding invoice for epoch 780, and handlers for the
+    /// submission RPCs that assert confirmed commitment on the wire.
+    fn start_rpc_stub(payer_override: Option<Pubkey>) -> PlanRpcFixture {
+        let pay_mode = payer_override.is_some();
         let server = Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}", server.server_addr());
-        let payer = Pubkey::new_unique();
+        let payer = payer_override.unwrap_or_else(Pubkey::new_unique);
         let vote = Pubkey::new_unique();
         let manager = Pubkey::new_unique();
         let manager_fee = Pubkey::new_unique();
@@ -476,6 +490,7 @@ mod tests {
         mint_data[44] = 9;
         mint_data[45] = 1;
 
+        let current_epoch: u64 = if pay_mode { 781 } else { 780 };
         let pool = StakePool {
             account_type: AccountType::StakePool,
             manager,
@@ -486,7 +501,7 @@ mod tests {
             token_program_id: token_program_id(),
             total_lamports: 10_000,
             pool_token_supply: 10_000,
-            last_update_epoch: 780,
+            last_update_epoch: current_epoch,
             ..StakePool::default()
         };
         let pool_data = borsh::to_vec(&pool).unwrap();
@@ -506,22 +521,34 @@ mod tests {
         }))
         .unwrap();
         reserve_data.resize(200, 0);
-        let first_accounts = vec![
+        let mut first_accounts = vec![
             rpc_account(invoicer_program_id(), invoicer_data),
             rpc_account(token_program_id(), mint_data),
             rpc_account(stake_pool_program_id(), pool_data),
             rpc_account(token_program_id(), token_data(payer, 0)),
             rpc_account(token_program_id(), token_data(invoicer_address(), 0)),
         ];
+        if pay_mode {
+            // One outstanding invoice for the single candidate epoch 780.
+            let mut invoice_data = Vec::with_capacity(96);
+            invoice_data.extend_from_slice(&vsol_bond_rs::invoice::INVOICE_DISCRIMINATOR);
+            invoice_data.extend_from_slice(invoicer_address().as_ref());
+            invoice_data.extend_from_slice(vote.as_ref());
+            invoice_data.extend_from_slice(&780_u64.to_le_bytes());
+            invoice_data.extend_from_slice(&1_000_u64.to_le_bytes());
+            invoice_data.extend_from_slice(&1_000_u64.to_le_bytes());
+            first_accounts.push(rpc_account(invoicer_program_id(), invoice_data));
+        }
         let second_accounts = vec![
             rpc_account(solana_stake_interface::program::id(), reserve_data),
             rpc_account(token_program_id(), token_data(manager, 0)),
         ];
         let methods = Arc::new(Mutex::new(Vec::new()));
         let thread_methods = Arc::clone(&methods);
+        let request_count = if pay_mode { 8 } else { 4 };
         let handle = std::thread::spawn(move || {
             let mut account_call = 0;
-            for mut request in server.incoming_requests().take(4) {
+            for mut request in server.incoming_requests().take(request_count) {
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap();
                 let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -531,7 +558,7 @@ mod tests {
                     "getEpochInfo" => serde_json::json!({
                         "absoluteSlot": 1,
                         "blockHeight": 1,
-                        "epoch": 780,
+                        "epoch": current_epoch,
                         "slotIndex": 0,
                         "slotsInEpoch": 432000,
                         "transactionCount": 0
@@ -548,6 +575,52 @@ mod tests {
                     "getBalance" => {
                         serde_json::json!({"context": {"slot": 1}, "value": 200000000})
                     }
+                    "getLatestBlockhash" => {
+                        assert_eq!(
+                            payload["params"][0]["commitment"], "confirmed",
+                            "blockhash must be fetched at confirmed commitment"
+                        );
+                        serde_json::json!({
+                            "context": {"slot": 1},
+                            "value": {
+                                "blockhash": Pubkey::new_unique().to_string(),
+                                "lastValidBlockHeight": 100
+                            }
+                        })
+                    }
+                    "simulateTransaction" => {
+                        assert_eq!(
+                            payload["params"][1]["commitment"], "confirmed",
+                            "simulation must run at confirmed commitment, not the finalized default"
+                        );
+                        serde_json::json!({
+                            "context": {"slot": 1},
+                            "value": {
+                                "err": null,
+                                "logs": [],
+                                "unitsConsumed": 100000,
+                                "accounts": null,
+                                "returnData": null
+                            }
+                        })
+                    }
+                    "sendTransaction" => {
+                        assert_eq!(
+                            payload["params"][1]["preflightCommitment"], "confirmed",
+                            "send preflight must run at confirmed commitment"
+                        );
+                        serde_json::json!(sent_transaction_signature(&payload["params"]))
+                    }
+                    "getSignatureStatuses" => serde_json::json!({
+                        "context": {"slot": 1},
+                        "value": [{
+                            "slot": 1,
+                            "confirmations": 0,
+                            "err": null,
+                            "status": {"Ok": null},
+                            "confirmationStatus": "confirmed"
+                        }]
+                    }),
                     other => panic!("unexpected plan RPC method {other}"),
                 };
                 let response = serde_json::json!({
@@ -567,6 +640,20 @@ mod tests {
             methods,
             handle,
         }
+    }
+
+    /// Extracts the payer signature from a sendTransaction request so the
+    /// stub echoes the exact signature the client derived locally.
+    fn sent_transaction_signature(params: &serde_json::Value) -> String {
+        let encoded = params[0].as_str().unwrap();
+        let bytes = match params[1]["encoding"].as_str() {
+            Some("base64") => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            _ => bs58::decode(encoded).into_vec().unwrap(),
+        };
+        assert_eq!(bytes[0], 1, "expected exactly one transaction signature");
+        solana_signature::Signature::from(<[u8; 64]>::try_from(&bytes[1..65]).unwrap()).to_string()
     }
 
     fn rpc_account(owner: Pubkey, data: Vec<u8>) -> serde_json::Value {
@@ -608,5 +695,46 @@ mod tests {
                 "simulateTransaction" | "sendTransaction" | "getSignatureStatuses"
             )
         }));
+    }
+
+    #[test]
+    fn real_pay_rpc_path_submits_at_confirmed_commitment() {
+        let payer_keypair = solana_keypair::Keypair::new();
+        let fixture = start_rpc_stub(Some(payer_keypair.pubkey()));
+        let dir = tempfile::tempdir().unwrap();
+        let payer_path = dir.path().join("payer.json");
+        std::fs::write(
+            &payer_path,
+            serde_json::to_string(&payer_keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let metrics_path = dir.path().join("vsol.prom");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, fixture.config(&metrics_path, payer_path)).unwrap();
+
+        run_with_sink(
+            Cli {
+                command: Command::Pay {
+                    config: config_path,
+                },
+            },
+            &FileMetricsSink,
+        )
+        .expect("pay must simulate, send, and confirm against the stub");
+        // finish() joins the stub thread, surfacing its commitment assertions.
+        let methods = fixture.finish();
+        for required in [
+            "getLatestBlockhash",
+            "simulateTransaction",
+            "sendTransaction",
+            "getSignatureStatuses",
+        ] {
+            assert!(
+                methods.iter().any(|method| method == required),
+                "pay path must call {required}; saw {methods:?}"
+            );
+        }
+        let metrics = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(metrics.contains("vsol_bond_last_run_success 1"));
     }
 }

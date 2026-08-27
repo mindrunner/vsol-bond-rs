@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
-use solana_client::rpc_client::RpcClient;
-use solana_commitment_config::CommitmentConfig;
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+};
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
 use solana_instruction::Instruction;
@@ -97,8 +100,18 @@ impl SubmissionBackend for RpcClient {
     }
 
     fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult> {
+        // Commitment is explicit: the blockhash comes from the confirmed
+        // bank, so simulating at the client default (finalized unless
+        // overridden) would deterministically fail with "Blockhash not found".
         let value = self
-            .simulate_transaction(transaction)
+            .simulate_transaction_with_config(
+                transaction,
+                RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcSimulateTransactionConfig::default()
+                },
+            )
             .context("transaction simulation RPC failed")?
             .value;
         Ok(SimulationResult {
@@ -109,8 +122,14 @@ impl SubmissionBackend for RpcClient {
     }
 
     fn send(&self, transaction: &Transaction) -> Result<Signature> {
-        self.send_transaction(transaction)
-            .context("failed to send transaction")
+        self.send_transaction_with_config(
+            transaction,
+            RpcSendTransactionConfig {
+                preflight_commitment: Some(CommitmentLevel::Confirmed),
+                ..RpcSendTransactionConfig::default()
+            },
+        )
+        .context("failed to send transaction")
     }
 
     fn reconcile(
@@ -338,6 +357,15 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             } else {
                 format!("\n{}", simulation.logs.join("\n"))
             };
+            // Nothing was sent, so transient simulation failures (e.g. the
+            // blockhash expiring between fetch and simulate) may safely retry
+            // with a fresh blockhash. Program errors still abort immediately.
+            if is_retryable_error(&error) && attempt + 1 < max_attempts {
+                last_error = Some(anyhow::anyhow!(
+                    "transaction simulation failed: {error}{logs}"
+                ));
+                continue;
+            }
             bail!("transaction simulation failed: {error}{logs}");
         }
         let limit = simulation
@@ -431,6 +459,7 @@ mod tests {
         send_calls: RefCell<usize>,
         reconcile_calls: RefCell<usize>,
         sent_signatures: RefCell<Vec<Signature>>,
+        simulation_queue: RefCell<VecDeque<SimulationResult>>,
         simulation: SimulationResult,
     }
 
@@ -445,7 +474,11 @@ mod tests {
 
         fn simulate(&self, _transaction: &Transaction) -> anyhow::Result<SimulationResult> {
             *self.simulation_calls.borrow_mut() += 1;
-            Ok(self.simulation.clone())
+            Ok(self
+                .simulation_queue
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| self.simulation.clone()))
         }
 
         fn send(&self, transaction: &Transaction) -> anyhow::Result<Signature> {
@@ -508,6 +541,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
@@ -542,6 +576,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(50_000),
                 error: Some("custom program error: 0x1770".into()),
@@ -555,6 +590,36 @@ mod tests {
         assert!(error.contains("guarded failure"));
         assert_eq!(*backend.latest_calls.borrow(), 1);
         assert_eq!(*backend.send_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn transient_blockhash_simulation_error_retries_with_fresh_blockhash() {
+        let backend = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1), blockhash(2)])),
+            send_results: RefCell::new(VecDeque::from([Ok(())])),
+            reconcile_results: RefCell::new(VecDeque::from([Ok(ReconcileOutcome::Confirmed)])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::from([SimulationResult {
+                units_consumed: None,
+                error: Some("Blockhash not found".into()),
+                logs: vec![],
+            }])),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        let payer = Keypair::new();
+        submit_with_backend(&backend, &payer, &[instruction()], 1_000, 3)
+            .expect("transient simulation error must retry");
+        assert_eq!(*backend.latest_calls.borrow(), 2);
+        assert_eq!(*backend.simulation_calls.borrow(), 2);
+        assert_eq!(*backend.send_calls.borrow(), 1);
     }
 
     #[test]
@@ -576,6 +641,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: None,
                 error: None,
@@ -597,6 +663,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
@@ -741,6 +808,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
@@ -788,6 +856,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
@@ -812,6 +881,7 @@ mod tests {
             send_calls: RefCell::new(0),
             reconcile_calls: RefCell::new(0),
             sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
             simulation: SimulationResult {
                 units_consumed: Some(100_000),
                 error: None,
