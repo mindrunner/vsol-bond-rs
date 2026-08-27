@@ -135,7 +135,18 @@ pub fn decode_stake_pool(account: &ChainAccount, current_epoch: u64) -> Result<V
         || pool.pool_token_supply == 0
         || pool.last_update_epoch != current_epoch
     {
-        bail!("stake pool state does not match guarded constants");
+        bail!(
+            "stake pool state does not match guarded constants (mint {}, \
+             token program {}, withdraw bump {}, total lamports {}, pool \
+             token supply {}, last update epoch {}, current epoch \
+             {current_epoch})",
+            pool.pool_mint,
+            pool.token_program_id,
+            pool.stake_withdraw_bump_seed,
+            pool.total_lamports,
+            pool.pool_token_supply,
+            pool.last_update_epoch,
+        );
     }
     if pool.sol_deposit_authority.is_some() {
         bail!("stake pool requires an unsupported SOL deposit authority");
@@ -187,12 +198,31 @@ fn validate_pool_mint(pool: &ValidatedStakePool, account: &ChainAccount) -> Resu
     let freeze_authority_tag = u32::from_le_bytes(account.data[46..50].try_into()?);
     if mint_authority_tag != 1
         || mint_authority != pool.withdraw_authority
-        || supply != pool.pool_token_supply
         || account.data[44] != 9
         || account.data[45] != 1
         || freeze_authority_tag != 0
     {
-        bail!("pool mint authority, supply, decimals, or freeze state mismatch");
+        bail!(
+            "pool mint authority, decimals, or freeze state mismatch \
+             (authority tag {mint_authority_tag}, authority {mint_authority}, \
+             expected authority {}, decimals {}, initialized {}, freeze tag \
+             {freeze_authority_tag})",
+            pool.withdraw_authority,
+            account.data[44],
+            account.data[45],
+        );
+    }
+    // Only the pool's withdraw authority can mint, so the mint supply can
+    // never legitimately exceed the pool's recorded supply. It can drift
+    // below it intra-epoch through direct burns; the on-chain program
+    // tolerates that and re-syncs pool_token_supply from the mint at each
+    // epoch's UpdateStakePoolBalance, and deposit math uses
+    // pool_token_supply on both sides, so drift is harmless here.
+    if supply > pool.pool_token_supply {
+        bail!(
+            "pool mint supply {supply} exceeds recorded pool token supply {}",
+            pool.pool_token_supply,
+        );
     }
     Ok(())
 }
@@ -677,7 +707,7 @@ mod tests {
             .is_err()
         );
         let mut bad_mint = mint.clone();
-        bad_mint.data[36..44].copy_from_slice(&9_999_u64.to_le_bytes());
+        bad_mint.data[36..44].copy_from_slice(&10_001_u64.to_le_bytes());
         assert!(
             validate_deposit_accounts(
                 &pool,
@@ -836,6 +866,41 @@ mod tests {
             data: borsh::to_vec(&raw).unwrap(),
         };
         assert!(decode_stake_pool(&account, 780).is_err());
+    }
+
+    #[test]
+    fn accepts_real_mainnet_mint_bytes_with_burn_drifted_pool_supply() {
+        // Captured verbatim from mainnet mint
+        // vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7. Direct burns pull the
+        // mint supply below the pool's recorded pool_token_supply between
+        // epoch updates; the live pool showed exactly that drift (85 base
+        // units on 2026-08-27) and it must not fail validation.
+        let data = include_bytes!("../tests/fixtures/mainnet_vsol_mint.bin").to_vec();
+        let supply = u64::from_le_bytes(data[36..44].try_into().unwrap());
+        let mut pool = pool();
+        pool.withdraw_authority = Pubkey::new_from_array(data[4..36].try_into().unwrap());
+        pool.pool_token_supply = supply + 85;
+        let mint = ChainAccount {
+            owner: token_program_id(),
+            data,
+        };
+        validate_pool_mint(&pool, &mint).expect("burn-drifted real mainnet mint");
+    }
+
+    #[test]
+    fn rejects_mint_supply_above_recorded_pool_supply() {
+        let mut pool = pool();
+        pool.pool_token_supply = 10_000;
+        let mint = ChainAccount {
+            owner: token_program_id(),
+            data: mint_data(pool.withdraw_authority, 10_001),
+        };
+        let error = validate_pool_mint(&pool, &mint).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds recorded pool token supply")
+        );
     }
 
     fn mint_data(authority: Pubkey, supply: u64) -> Vec<u8> {
