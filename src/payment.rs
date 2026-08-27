@@ -212,12 +212,8 @@ fn validate_pool_mint(pool: &ValidatedStakePool, account: &ChainAccount) -> Resu
             account.data[45],
         );
     }
-    // Only the pool's withdraw authority can mint, so the mint supply can
-    // never legitimately exceed the pool's recorded supply. It can drift
-    // below it intra-epoch through direct burns; the on-chain program
-    // tolerates that and re-syncs pool_token_supply from the mint at each
-    // epoch's UpdateStakePoolBalance, and deposit math uses
-    // pool_token_supply on both sides, so drift is harmless here.
+    // Direct burns pull the mint supply below pool_token_supply between
+    // epoch re-syncs; only supply above it means minting outside the pool.
     if supply > pool.pool_token_supply {
         bail!(
             "pool mint supply {supply} exceeds recorded pool token supply {}",
@@ -264,7 +260,8 @@ fn validate_manager_fee(
 }
 
 pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Result<PaymentPlan> {
-    if context.invoices.is_empty() {
+    let mut invoices = context.invoices;
+    if invoices.is_empty() {
         return Ok(PaymentPlan {
             payer: context.payer,
             payer_sol_balance_lamports: context.payer_sol_balance,
@@ -278,10 +275,10 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
             instructions: Vec::new(),
         });
     }
-    if context.invoices.len() > 6 {
+    if invoices.len() > 6 {
         bail!("at most six invoices may be paid");
     }
-    let total = context.invoices.iter().try_fold(0_u64, |sum, invoice| {
+    for (index, invoice) in invoices.iter().enumerate() {
         if invoice.balance_outstanding == 0
             || invoice.balance_outstanding > invoice.amount_vsol
             || invoice.invoicer != invoicer_address()
@@ -290,12 +287,32 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
         {
             bail!("invalid invoice in payment plan");
         }
-        sum.checked_add(invoice.balance_outstanding)
-            .ok_or_else(|| anyhow::anyhow!("invoice total overflow"))
-    })?;
-    if total == 0 || total > limits.max_total_vsol || total > 5_000_000_000 {
-        bail!("invoice total exceeds payment cap");
+        if index > 0 && invoice.epoch <= invoices[index - 1].epoch {
+            bail!("invoices must be unique and ordered oldest first");
+        }
     }
+    // Pay the longest oldest-first prefix that fits under the cap; the rest
+    // wait for later runs. Refusing outright would deadlock once accumulated
+    // arrears exceed one run's cap.
+    let cap = limits.max_total_vsol.min(5_000_000_000);
+    let mut total = 0_u64;
+    let mut payable = 0_usize;
+    for invoice in &invoices {
+        match total.checked_add(invoice.balance_outstanding) {
+            Some(next) if next <= cap => {
+                total = next;
+                payable += 1;
+            }
+            _ => break,
+        }
+    }
+    if payable == 0 {
+        bail!(
+            "oldest invoice outstanding {} exceeds the payment cap {cap}",
+            invoices[0].balance_outstanding,
+        );
+    }
+    invoices.truncate(payable);
     if context.stake_pool.pool_mint != vsol_mint()
         || context.stake_pool.token_program_id != token_program_id()
         || context.stake_pool.sol_deposit_authority.is_some()
@@ -346,7 +363,7 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
         bail!("payer SOL balance would breach reserve");
     }
 
-    let mut instructions = Vec::with_capacity(context.invoices.len() + 2);
+    let mut instructions = Vec::with_capacity(invoices.len() + 2);
     if !context.source_ata_exists {
         if context.existing_vsol != 0 {
             bail!("missing source ATA cannot have an existing balance");
@@ -379,7 +396,7 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
             shortfall,
         ));
     }
-    for invoice in &context.invoices {
+    for invoice in &invoices {
         instructions.push(pay_invoice_instruction(
             invoice,
             context.payer,
@@ -391,7 +408,7 @@ pub fn build_payment_plan(context: PaymentContext, limits: PaymentLimits) -> Res
         payer: context.payer,
         payer_sol_balance_lamports: context.payer_sol_balance,
         source_ata,
-        invoices: context.invoices,
+        invoices,
         total_outstanding_vsol: total,
         existing_vsol: context.existing_vsol,
         vsol_shortfall: shortfall,
@@ -576,6 +593,34 @@ mod tests {
         let exact_required = 5 + 100_000_000 + 1_000_000;
         assert!(build_payment_plan(context(0, exact_required), limits()).is_ok());
         assert!(build_payment_plan(context(0, exact_required - 1), limits()).is_err());
+    }
+
+    #[test]
+    fn trims_to_oldest_prefix_when_arrears_exceed_cap() {
+        let mut ctx = context(0, 10_000_000_000);
+        ctx.invoices = vec![
+            invoice(780, 3_000_000_000, 3_000_000_000),
+            invoice(781, 1_500_000_000, 1_500_000_000),
+            invoice(782, 1_000_000_000, 1_000_000_000),
+        ];
+        let plan = build_payment_plan(ctx, limits()).expect("plan");
+        assert_eq!(
+            plan.invoices.iter().map(|i| i.epoch).collect::<Vec<_>>(),
+            vec![780, 781]
+        );
+        assert_eq!(plan.total_outstanding_vsol, 4_500_000_000);
+        assert_eq!(plan.instructions.len(), 3);
+    }
+
+    #[test]
+    fn rejects_unordered_or_duplicate_invoices() {
+        let mut ctx = context(0, 10_000_000_000);
+        ctx.invoices = vec![invoice(781, 10, 3), invoice(780, 10, 2)];
+        assert!(build_payment_plan(ctx, limits()).is_err());
+
+        let mut ctx = context(0, 10_000_000_000);
+        ctx.invoices = vec![invoice(780, 10, 3), invoice(780, 10, 3)];
+        assert!(build_payment_plan(ctx, limits()).is_err());
     }
 
     #[test]
@@ -871,10 +916,7 @@ mod tests {
     #[test]
     fn accepts_real_mainnet_mint_bytes_with_burn_drifted_pool_supply() {
         // Captured verbatim from mainnet mint
-        // vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7. Direct burns pull the
-        // mint supply below the pool's recorded pool_token_supply between
-        // epoch updates; the live pool showed exactly that drift (85 base
-        // units on 2026-08-27) and it must not fail validation.
+        // vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7.
         let data = include_bytes!("../tests/fixtures/mainnet_vsol_mint.bin").to_vec();
         let supply = u64::from_le_bytes(data[36..44].try_into().unwrap());
         let mut pool = pool();

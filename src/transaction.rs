@@ -100,9 +100,8 @@ impl SubmissionBackend for RpcClient {
     }
 
     fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult> {
-        // Commitment is explicit: the blockhash comes from the confirmed
-        // bank, so simulating at the client default (finalized unless
-        // overridden) would deterministically fail with "Blockhash not found".
+        // Simulating at the default finalized commitment would reject the
+        // confirmed blockhash with "Blockhash not found".
         let value = self
             .simulate_transaction_with_config(
                 transaction,
@@ -200,19 +199,21 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
         bail!("reconciliation poll limit must be positive");
     }
     let mut observed_processed = false;
-    let mut uncertain_read = false;
     let mut last_transient_error = None;
 
     for poll in 0..max_polls {
+        // ExpiredNotFound may only be declared from reads taken in a single
+        // clean poll: the live status must be a successful None right now,
+        // not carried over from an iteration whose read failed.
+        let mut status_known_absent = false;
         match backend.signature_status(signature) {
             Ok(Some(ObservedStatus::Confirmed)) => return Ok(ReconcileOutcome::Confirmed),
             Ok(Some(ObservedStatus::Failed(error))) => {
                 return Ok(ReconcileOutcome::Failed(error));
             }
             Ok(Some(ObservedStatus::Processed)) => observed_processed = true,
-            Ok(None) => {}
+            Ok(None) => status_known_absent = true,
             Err(error) if is_retryable_anyhow(&error) => {
-                uncertain_read = true;
                 last_transient_error = Some(error.to_string());
             }
             Err(error) => return Err(error),
@@ -221,7 +222,6 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
         let blockhash_valid = match backend.blockhash_valid(&blockhash.blockhash) {
             Ok(valid) => valid,
             Err(error) if is_retryable_anyhow(&error) => {
-                uncertain_read = true;
                 last_transient_error = Some(error.to_string());
                 if poll + 1 < max_polls {
                     backend.wait_before_poll();
@@ -235,7 +235,6 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
         let current_block_height = match backend.current_block_height() {
             Ok(height) => height,
             Err(error) if is_retryable_anyhow(&error) => {
-                uncertain_read = true;
                 last_transient_error = Some(error.to_string());
                 if poll + 1 < max_polls {
                     backend.wait_before_poll();
@@ -253,12 +252,11 @@ fn reconcile_with_backend<B: ReconciliationBackend>(
                     return Ok(ReconcileOutcome::Failed(error));
                 }
                 Ok(Some(ObservedStatus::Processed)) => observed_processed = true,
-                Ok(None) if !observed_processed && !uncertain_read => {
+                Ok(None) if !observed_processed && status_known_absent => {
                     return Ok(ReconcileOutcome::ExpiredNotFound);
                 }
                 Ok(None) => {}
                 Err(error) if is_retryable_anyhow(&error) => {
-                    uncertain_read = true;
                     last_transient_error = Some(error.to_string());
                 }
                 Err(error) => return Err(error),
@@ -357,9 +355,8 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             } else {
                 format!("\n{}", simulation.logs.join("\n"))
             };
-            // Nothing was sent, so transient simulation failures (e.g. the
-            // blockhash expiring between fetch and simulate) may safely retry
-            // with a fresh blockhash. Program errors still abort immediately.
+            // Nothing was sent yet, so transient failures may retry with a
+            // fresh blockhash; program errors abort immediately.
             if is_retryable_error(&error) && attempt + 1 < max_attempts {
                 last_error = Some(anyhow::anyhow!(
                     "transaction simulation failed: {error}{logs}"
@@ -384,23 +381,27 @@ pub fn submit_with_backend<B: SubmissionBackend>(
             .signatures
             .first()
             .ok_or_else(|| anyhow::anyhow!("signed transaction has no signature"))?;
-        match backend.send(&transaction) {
+        let send_error = match backend.send(&transaction) {
             Ok(returned_signature) if returned_signature != local_signature => {
                 bail!("RPC returned a transaction signature mismatch");
             }
-            Ok(_) => {}
-            Err(error) if is_retryable_anyhow(&error) => {}
+            Ok(_) => None,
+            Err(error) if is_retryable_anyhow(&error) => Some(error),
             Err(error) => return Err(error),
-        }
+        };
         match backend.reconcile(&local_signature, &blockhash)? {
             ReconcileOutcome::Confirmed => return Ok(local_signature),
             ReconcileOutcome::Failed(error) => {
                 bail!("transaction was confirmed with an error: {error}");
             }
             ReconcileOutcome::ExpiredNotFound => {
-                last_error = Some(anyhow::anyhow!(
-                    "transaction was not observed before blockhash expiry"
-                ));
+                last_error = Some(match send_error {
+                    Some(error) => anyhow::anyhow!(
+                        "transaction was not observed before blockhash expiry; \
+                         send had failed: {error:#}"
+                    ),
+                    None => anyhow::anyhow!("transaction was not observed before blockhash expiry"),
+                });
                 if attempt + 1 == max_attempts {
                     break;
                 }
@@ -429,7 +430,8 @@ pub fn is_retryable_error(message: &str) -> bool {
         "timeout",
         "timed out",
         "node is unhealthy",
-        "429",
+        "too many requests",
+        "rate limit",
         "transport",
         "connection reset",
         "temporarily unavailable",
@@ -566,6 +568,11 @@ mod tests {
         ));
         assert!(is_retryable_error("Blockhash not found"));
         assert!(is_retryable_error("request timed out"));
+        assert!(is_retryable_error(
+            "HTTP status client error (429 Too Many Requests)"
+        ));
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(!is_retryable_error("verification failed at slot 4429310"));
 
         let backend = MockBackend {
             blockhashes: RefCell::new(VecDeque::from([blockhash(1)])),
@@ -817,6 +824,59 @@ mod tests {
         };
         assert!(submit_with_backend(&submission, &Keypair::new(), &[instruction()], 0, 3).is_err());
         assert_eq!(*submission.send_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn transient_read_does_not_block_later_expiry_proof() {
+        let backend = ReconciliationMock {
+            statuses: RefCell::new(VecDeque::from([
+                Err(anyhow::anyhow!("transport timeout").context("status RPC failed")),
+                Ok(None),
+            ])),
+            validities: RefCell::new(VecDeque::from([Ok(false), Ok(false)])),
+            block_heights: RefCell::new(VecDeque::from([Ok(101), Ok(102)])),
+            final_statuses: RefCell::new(VecDeque::from([Ok(None), Ok(None)])),
+            validity_calls: RefCell::new(0),
+            block_height_calls: RefCell::new(0),
+        };
+        let outcome = reconcile_with_backend(
+            &backend,
+            &Signature::from([8; 64]),
+            &BlockhashContext {
+                blockhash: Hash::new_from_array([7; 32]),
+                last_valid_block_height: 100,
+            },
+            3,
+        )
+        .expect("reconciliation");
+        assert_eq!(outcome, ReconcileOutcome::ExpiredNotFound);
+    }
+
+    #[test]
+    fn surfaces_send_error_when_transaction_expires_unobserved() {
+        let backend = MockBackend {
+            blockhashes: RefCell::new(VecDeque::from([blockhash(1)])),
+            send_results: RefCell::new(VecDeque::from([Err(anyhow::anyhow!("request timed out"))])),
+            reconcile_results: RefCell::new(VecDeque::from([Ok(
+                ReconcileOutcome::ExpiredNotFound,
+            )])),
+            latest_calls: RefCell::new(0),
+            simulation_calls: RefCell::new(0),
+            send_calls: RefCell::new(0),
+            reconcile_calls: RefCell::new(0),
+            sent_signatures: RefCell::new(Vec::new()),
+            simulation_queue: RefCell::new(VecDeque::new()),
+            simulation: SimulationResult {
+                units_consumed: Some(100_000),
+                error: None,
+                logs: vec![],
+            },
+        };
+        let error = submit_with_backend(&backend, &Keypair::new(), &[instruction()], 0, 1)
+            .expect_err("expiry after failed send")
+            .to_string();
+        assert!(error.contains("not observed before blockhash expiry"));
+        assert!(error.contains("request timed out"));
     }
 
     #[test]

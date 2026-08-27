@@ -75,9 +75,8 @@ fn run_with_sink<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
             error,
         ));
     }
-    // The whole pipeline operates at confirmed commitment. The RpcClient
-    // default is finalized, which rejects confirmed blockhashes during
-    // simulation and preflight with "Blockhash not found".
+    // The default finalized commitment rejects confirmed blockhashes with
+    // "Blockhash not found".
     let client = RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_commitment_config::CommitmentConfig::confirmed(),
