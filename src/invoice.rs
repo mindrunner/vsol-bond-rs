@@ -6,9 +6,10 @@ pub const FIRST_INVOICE_EPOCH: u64 = 780;
 pub const INVOICE_DISCRIMINATOR: [u8; 8] = [51, 194, 250, 114, 6, 104, 18, 164];
 pub const INVOICER_DISCRIMINATOR: [u8; 8] = [130, 60, 88, 174, 12, 36, 237, 134];
 pub const INVOICE_ACCOUNT_LEN: usize = 96;
+// Minimum lengths of the known prefixes. The program has appended fields after
+// them across upgrades (invoicer: 208 -> 272 -> 304 bytes), so trailing bytes
+// are ignored; the discriminator and field checks catch real layout changes.
 pub const INVOICER_ACCOUNT_LEN: usize = 208;
-// The deployed program appended two pubkeys without changing the known prefix.
-const EXTENDED_INVOICER_ACCOUNT_LEN: usize = 272;
 
 const INVOICER_PROGRAM: &str = "EpoivtVh9dgWFxE6MYgF3YnobYWtZr2VfCuP7iT3N927";
 const INVOICER_BASE: &str = "vocefgUvSTg7q4ZfeTLg2RAgeYN6V7t6rNVNb3dzrh1";
@@ -81,14 +82,17 @@ pub fn decode_invoice(
     if account.owner != invoicer_program_id() {
         bail!("invoice has foreign owner");
     }
-    if account.data.len() != INVOICE_ACCOUNT_LEN {
-        bail!("invoice has invalid data length");
+    if account.data.len() < INVOICE_ACCOUNT_LEN {
+        bail!(
+            "invoice data too short: {} < {INVOICE_ACCOUNT_LEN} bytes",
+            account.data.len()
+        );
     }
     if account.data[..8] != INVOICE_DISCRIMINATOR {
         bail!("invoice discriminator mismatch");
     }
     let (invoicer, vote_account, epoch, amount_vsol, balance_outstanding) =
-        parse_invoice_layout(&account.data[8..])?;
+        parse_invoice_layout(&account.data[8..INVOICE_ACCOUNT_LEN])?;
     let invoice = Invoice {
         address,
         invoicer,
@@ -124,11 +128,11 @@ pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoic
     if address != expected_address || account.owner != invoicer_program_id() {
         bail!("invalid invoicer address or owner");
     }
-    if !matches!(
-        account.data.len(),
-        INVOICER_ACCOUNT_LEN | EXTENDED_INVOICER_ACCOUNT_LEN
-    ) {
-        bail!("invoicer has invalid data length");
+    if account.data.len() < INVOICER_ACCOUNT_LEN {
+        bail!(
+            "invoicer data too short: {} < {INVOICER_ACCOUNT_LEN} bytes",
+            account.data.len()
+        );
     }
     if account.data[..8] != INVOICER_DISCRIMINATOR {
         bail!("invoicer discriminator mismatch");
@@ -314,8 +318,11 @@ mod tests {
         let mut bad = account.clone();
         bad.data[0] ^= 1;
         assert!(decode_invoice(address, &bad, vote, 780).is_err());
+        let mut extended = account.clone();
+        extended.data.extend_from_slice(&[7; 32]);
+        decode_invoice(address, &extended, vote, 780).expect("trailing bytes are ignored");
         let mut bad = account.clone();
-        bad.data.push(0);
+        bad.data.pop();
         assert!(decode_invoice(address, &bad, vote, 780).is_err());
         let mut bad = account;
         bad.data[88..96].copy_from_slice(&51_u64.to_le_bytes());
@@ -342,24 +349,28 @@ mod tests {
     }
 
     #[test]
-    fn decodes_live_extended_invoicer_layout() {
+    fn decodes_extended_invoicer_layouts() {
         let reserves = Pubkey::new_unique();
-        let mut data = invoicer_data(reserves);
-        data.extend_from_slice(&[7; 64]);
-        assert_eq!(data.len(), 272);
+        // 272 and 304 are live mainnet lengths; 305 covers arbitrary trailing data.
+        for extra in [64, 96, 97] {
+            let mut data = invoicer_data(reserves);
+            data.extend(std::iter::repeat_n(7, extra));
+            let account = ChainAccount {
+                owner: invoicer_program_id(),
+                data,
+            };
+            let decoded =
+                decode_invoicer(invoicer_address(), &account).expect("extended invoicer account");
+            assert_eq!(decoded.vsol_reserves, reserves);
+        }
 
+        let mut truncated = invoicer_data(reserves);
+        truncated.pop();
         let account = ChainAccount {
             owner: invoicer_program_id(),
-            data,
+            data: truncated,
         };
-        let decoded =
-            decode_invoicer(invoicer_address(), &account).expect("extended invoicer account");
-
-        assert_eq!(decoded.vsol_reserves, reserves);
-
-        let mut unsupported = account;
-        unsupported.data.push(0);
-        assert!(decode_invoicer(invoicer_address(), &unsupported).is_err());
+        assert!(decode_invoicer(invoicer_address(), &account).is_err());
     }
 
     #[test]
