@@ -12,7 +12,22 @@ pub const INVOICE_ACCOUNT_LEN: usize = 96;
 pub const INVOICER_ACCOUNT_LEN: usize = 208;
 
 const INVOICER_PROGRAM: &str = "EpoivtVh9dgWFxE6MYgF3YnobYWtZr2VfCuP7iT3N927";
-const INVOICER_BASE: &str = "vocefgUvSTg7q4ZfeTLg2RAgeYN6V7t6rNVNb3dzrh1";
+// Trusted invoicers, as in Vault's reference bot (SolanaVault/saas-payment-bot
+// KNOWN_INVOICERS). create_invoicer is permissionless, so anyone can bill any
+// vote account: only these are ever paid. Vault moved billing to VLP at the
+// epoch-1064 cutover; the vSOL-era invoicer Fn5Fb... is retired. A new
+// invoicer needs a release here; until then its invoices still show in the
+// unpaid metrics, so the gap alerts instead of going silent.
+pub const TRUSTED_INVOICERS: [&str; 2] = [
+    "DzWNQFv5FPVwpiSehxDJJ8KMMMp89XEjVswsAmqB5ARF", // SaaS, VLP
+    "9HE9R14dazhR1rz6Vamap7zTzkVihqiWVk5nS447PB6F", // community pool, VLP
+];
+// Absolute offset of the invoicer's settlement mint (304-byte layout).
+pub const INVOICER_MINT_OFFSET: usize = 272;
+pub const INVOICER_MINT_AWARE_LEN: usize = INVOICER_MINT_OFFSET + 32;
+// Absolute offset of the invoice's vote account field.
+pub const INVOICE_VOTE_OFFSET: usize = 8 + 32;
+const LEGACY_INVOICER_BASE: &str = "vocefgUvSTg7q4ZfeTLg2RAgeYN6V7t6rNVNb3dzrh1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainAccount {
@@ -32,6 +47,9 @@ pub struct Invoice {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invoicer {
+    pub address: Pubkey,
+    /// Settlement mint the invoices of this invoicer are paid in.
+    pub mint: Pubkey,
     pub base_key: Pubkey,
     pub bump: u8,
     pub vsol_reserves: Pubkey,
@@ -45,15 +63,25 @@ pub fn invoicer_program_id() -> Pubkey {
     Pubkey::from_str(INVOICER_PROGRAM).expect("constant invoicer program")
 }
 
+pub fn trusted_invoicers() -> Vec<Pubkey> {
+    TRUSTED_INVOICERS
+        .iter()
+        .map(|address| Pubkey::from_str(address).expect("constant trusted invoicer"))
+        .collect()
+}
+
+pub fn find_invoicer_address_for(base: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"invoicer", base.as_ref()], &invoicer_program_id())
+}
+
+/// The original Vault invoicer (epochs up to 1063). Only for tests and
+/// fixtures: payments use the invoicers discovered on chain.
 pub fn invoicer_base() -> Pubkey {
-    Pubkey::from_str(INVOICER_BASE).expect("constant invoicer base")
+    Pubkey::from_str(LEGACY_INVOICER_BASE).expect("constant invoicer base")
 }
 
 pub fn find_invoicer_address() -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"invoicer", invoicer_base().as_ref()],
-        &invoicer_program_id(),
-    )
+    find_invoicer_address_for(&invoicer_base())
 }
 
 pub fn invoicer_address() -> Pubkey {
@@ -76,9 +104,20 @@ pub fn find_invoice_address(invoicer: &Pubkey, vote_account: &Pubkey, epoch: u64
 pub fn decode_invoice(
     address: Pubkey,
     account: &ChainAccount,
+    expected_invoicer: Pubkey,
     expected_vote: Pubkey,
     expected_epoch: u64,
 ) -> Result<Invoice> {
+    let invoice = decode_invoice_unchecked(address, account)?;
+    validate_invoice(&invoice, expected_invoicer, expected_vote, expected_epoch)?;
+    Ok(invoice)
+}
+
+/// Decodes an invoice found by a program scan: owner, discriminator, amounts
+/// and the PDA derivation from its own fields are checked, the invoicer is not.
+/// Only for reporting; payments go through `decode_invoice` against a trusted
+/// invoicer.
+pub fn decode_invoice_unchecked(address: Pubkey, account: &ChainAccount) -> Result<Invoice> {
     if account.owner != invoicer_program_id() {
         bail!("invoice has foreign owner");
     }
@@ -101,12 +140,17 @@ pub fn decode_invoice(
         amount_vsol,
         balance_outstanding,
     };
-    validate_invoice(&invoice, expected_vote, expected_epoch)?;
+    validate_invoice(&invoice, invoicer, vote_account, epoch)?;
     Ok(invoice)
 }
 
-fn validate_invoice(invoice: &Invoice, expected_vote: Pubkey, expected_epoch: u64) -> Result<()> {
-    if invoice.invoicer != invoicer_address()
+fn validate_invoice(
+    invoice: &Invoice,
+    expected_invoicer: Pubkey,
+    expected_vote: Pubkey,
+    expected_epoch: u64,
+) -> Result<()> {
+    if invoice.invoicer != expected_invoicer
         || invoice.vote_account != expected_vote
         || invoice.epoch != expected_epoch
     {
@@ -124,13 +168,12 @@ fn validate_invoice(invoice: &Invoice, expected_vote: Pubkey, expected_epoch: u6
 }
 
 pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoicer> {
-    let (expected_address, expected_bump) = find_invoicer_address();
-    if address != expected_address || account.owner != invoicer_program_id() {
-        bail!("invalid invoicer address or owner");
+    if account.owner != invoicer_program_id() {
+        bail!("invalid invoicer owner");
     }
-    if account.data.len() < INVOICER_ACCOUNT_LEN {
+    if account.data.len() < INVOICER_MINT_AWARE_LEN {
         bail!(
-            "invoicer data too short: {} < {INVOICER_ACCOUNT_LEN} bytes",
+            "invoicer data too short: {} < {INVOICER_MINT_AWARE_LEN} bytes (pre-mint layout)",
             account.data.len()
         );
     }
@@ -147,14 +190,19 @@ pub fn decode_invoicer(address: Pubkey, account: &ChainAccount) -> Result<Invoic
         invoice_creator,
         padding,
     ) = parse_invoicer_layout(&account.data[8..INVOICER_ACCOUNT_LEN])?;
-    if base_key != invoicer_base()
-        || bump != expected_bump
+    if find_invoicer_address_for(&base_key) != (address, bump)
         || padding != [0; 7]
         || vsol_reserves == Pubkey::default()
     {
         bail!("invoicer derivation fields are invalid");
     }
+    let mint = pubkey_at(account.data.as_slice(), INVOICER_MINT_OFFSET)?;
+    if mint == Pubkey::default() {
+        bail!("invoicer {address} has no settlement mint");
+    }
     Ok(Invoicer {
+        address,
+        mint,
         base_key,
         bump,
         vsol_reserves,
@@ -233,7 +281,12 @@ pub fn filter_invoices(
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     for invoice in &invoices {
-        validate_invoice(invoice, invoice.vote_account, invoice.epoch)?;
+        validate_invoice(
+            invoice,
+            invoice.invoicer,
+            invoice.vote_account,
+            invoice.epoch,
+        )?;
         if invoice.epoch < FIRST_INVOICE_EPOCH || !allowed.contains(&invoice.epoch) {
             continue;
         }
@@ -245,6 +298,31 @@ pub fn filter_invoices(
     invoices.sort_unstable_by_key(|invoice| invoice.epoch);
     invoices.truncate(max_invoices);
     Ok(invoices)
+}
+
+/// Unpaid invoices for one vote account, whichever invoicer issued them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnpaidInvoices {
+    pub count: u64,
+    /// Oldest unpaid epoch, 0 when nothing is unpaid.
+    pub oldest_epoch: u64,
+}
+
+pub fn summarize_unpaid(invoices: &[Invoice], vote_account: Pubkey) -> UnpaidInvoices {
+    let mut summary = UnpaidInvoices::default();
+    for invoice in invoices {
+        if invoice.vote_account != vote_account
+            || invoice.epoch < FIRST_INVOICE_EPOCH
+            || invoice.balance_outstanding == 0
+        {
+            continue;
+        }
+        summary.count += 1;
+        if summary.oldest_epoch == 0 || invoice.epoch < summary.oldest_epoch {
+            summary.oldest_epoch = invoice.epoch;
+        }
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -274,17 +352,22 @@ mod tests {
     }
 
     fn invoicer_data(reserves: Pubkey) -> Vec<u8> {
-        let (address, bump) = find_invoicer_address();
+        invoicer_data_for(&invoicer_base(), reserves, Pubkey::new_from_array([5; 32]))
+    }
+
+    fn invoicer_data_for(base: &Pubkey, reserves: Pubkey, mint: Pubkey) -> Vec<u8> {
+        let (_, bump) = find_invoicer_address_for(base);
         let mut data = Vec::with_capacity(INVOICER_ACCOUNT_LEN);
         data.extend_from_slice(&INVOICER_DISCRIMINATOR);
-        data.extend_from_slice(invoicer_base().as_ref());
+        data.extend_from_slice(base.as_ref());
         data.push(bump);
         data.extend_from_slice(&[0; 7]);
         data.extend_from_slice(reserves.as_ref());
         for fill in 1..=4 {
             data.extend_from_slice(&[fill; 32]);
         }
-        assert_eq!(address, invoicer_address());
+        data.resize(INVOICER_MINT_OFFSET, 6);
+        data.extend_from_slice(mint.as_ref());
         data
     }
 
@@ -308,25 +391,108 @@ mod tests {
             owner: invoicer_program_id(),
             data: invoice_data(invoicer_address(), vote, 780, 50, 25),
         };
-        let invoice = decode_invoice(address, &account, vote, 780).expect("decode");
+        let invoice =
+            decode_invoice(address, &account, invoicer_address(), vote, 780).expect("decode");
         assert_eq!(invoice.balance_outstanding, 25);
         assert_eq!(invoice.amount_vsol, 50);
 
         let mut bad = account.clone();
         bad.owner = Pubkey::new_unique();
-        assert!(decode_invoice(address, &bad, vote, 780).is_err());
+        assert!(decode_invoice(address, &bad, invoicer_address(), vote, 780).is_err());
         let mut bad = account.clone();
         bad.data[0] ^= 1;
-        assert!(decode_invoice(address, &bad, vote, 780).is_err());
+        assert!(decode_invoice(address, &bad, invoicer_address(), vote, 780).is_err());
         let mut extended = account.clone();
         extended.data.extend_from_slice(&[7; 32]);
-        decode_invoice(address, &extended, vote, 780).expect("trailing bytes are ignored");
+        decode_invoice(address, &extended, invoicer_address(), vote, 780)
+            .expect("trailing bytes are ignored");
         let mut bad = account.clone();
         bad.data.pop();
-        assert!(decode_invoice(address, &bad, vote, 780).is_err());
+        assert!(decode_invoice(address, &bad, invoicer_address(), vote, 780).is_err());
         let mut bad = account;
         bad.data[88..96].copy_from_slice(&51_u64.to_le_bytes());
-        assert!(decode_invoice(address, &bad, vote, 780).is_err());
+        assert!(decode_invoice(address, &bad, invoicer_address(), vote, 780).is_err());
+    }
+
+    #[test]
+    fn decode_invoice_rejects_another_invoicer() {
+        let vote = vote_program_id();
+        let address = find_invoice_address(&invoicer_address(), &vote, 780);
+        let account = ChainAccount {
+            owner: invoicer_program_id(),
+            data: invoice_data(invoicer_address(), vote, 780, 50, 25),
+        };
+        let other =
+            find_invoicer_address_for(&key("F3yy3FVpwq9MV321AzALFcDWZp9XBBHbMas3t4AtEtCW")).0;
+        assert!(decode_invoice(address, &account, other, vote, 780).is_err());
+        let unchecked = decode_invoice_unchecked(address, &account).expect("scan decode");
+        assert_eq!(unchecked.invoicer, invoicer_address());
+    }
+
+    #[test]
+    fn decodes_the_real_saas_invoicer_and_its_vlp_mint() {
+        let address = key(TRUSTED_INVOICERS[0]);
+        assert_eq!(
+            find_invoicer_address_for(&key("F3yy3FVpwq9MV321AzALFcDWZp9XBBHbMas3t4AtEtCW")).0,
+            address
+        );
+        let account = ChainAccount {
+            owner: invoicer_program_id(),
+            data: include_bytes!("../tests/fixtures/mainnet_saas_invoicer.bin").to_vec(),
+        };
+        let decoded = decode_invoicer(address, &account).expect("real SaaS invoicer");
+        assert_eq!(
+            decoded.mint.to_string(),
+            "EUWoTx5vQQrxaDFdeK2PLUVbnmRWjw4x6sBbmcxBaHjF"
+        );
+        assert_eq!(
+            decoded.vsol_reserves.to_string(),
+            "B5CP3t1hdABdjXox5zzcTsjoEiv57aXjm4iBgcYMDYLw"
+        );
+        // Data claims a base whose PDA is not this address.
+        assert!(decode_invoicer(invoicer_address(), &account).is_err());
+        // Not owned by the invoicer program.
+        let mut wrong_program = account.clone();
+        wrong_program.owner = Pubkey::new_unique();
+        assert!(decode_invoicer(address, &wrong_program).is_err());
+        // Zeroed mint: pre-mint-aware settlement.
+        let mut no_mint = account;
+        no_mint.data[INVOICER_MINT_OFFSET..INVOICER_MINT_AWARE_LEN].fill(0);
+        assert!(decode_invoicer(address, &no_mint).is_err());
+        assert_eq!(trusted_invoicers().len(), 2);
+    }
+
+    #[test]
+    fn summarizes_unpaid_invoices_across_invoicers() {
+        let vote = vote_program_id();
+        let new_invoicer =
+            find_invoicer_address_for(&key("F3yy3FVpwq9MV321AzALFcDWZp9XBBHbMas3t4AtEtCW")).0;
+        let invoice = |invoicer: Pubkey, epoch: u64, outstanding: u64| Invoice {
+            address: find_invoice_address(&invoicer, &vote, epoch),
+            invoicer,
+            vote_account: vote,
+            epoch,
+            amount_vsol: 10,
+            balance_outstanding: outstanding,
+        };
+        let invoices = vec![
+            invoice(invoicer_address(), 768, 10),
+            invoice(invoicer_address(), 1063, 0),
+            invoice(new_invoicer, 1066, 10),
+            invoice(new_invoicer, 1065, 4),
+            Invoice {
+                vote_account: Pubkey::new_unique(),
+                ..invoice(new_invoicer, 1000, 10)
+            },
+        ];
+        assert_eq!(
+            summarize_unpaid(&invoices, vote),
+            UnpaidInvoices {
+                count: 2,
+                oldest_epoch: 1065
+            }
+        );
+        assert_eq!(summarize_unpaid(&[], vote), UnpaidInvoices::default());
     }
 
     #[test]
@@ -351,8 +517,8 @@ mod tests {
     #[test]
     fn decodes_extended_invoicer_layouts() {
         let reserves = Pubkey::new_unique();
-        // 272 and 304 are live mainnet lengths; 305 covers arbitrary trailing data.
-        for extra in [64, 96, 97] {
+        // 304 is the live mint-aware length; 305 covers arbitrary trailing data.
+        for extra in [0, 1] {
             let mut data = invoicer_data(reserves);
             data.extend(std::iter::repeat_n(7, extra));
             let account = ChainAccount {
@@ -364,8 +530,9 @@ mod tests {
             assert_eq!(decoded.vsol_reserves, reserves);
         }
 
+        // 272 bytes is the pre-mint layout of the retired vSOL era.
         let mut truncated = invoicer_data(reserves);
-        truncated.pop();
+        truncated.truncate(272);
         let account = ChainAccount {
             owner: invoicer_program_id(),
             data: truncated,
@@ -386,7 +553,8 @@ mod tests {
         let invoicer = invoicer_data(reserves);
         let mut unaligned = vec![0xff];
         unaligned.extend_from_slice(&invoicer);
-        let parsed = parse_invoicer_layout(&unaligned[9..]).expect("unaligned invoicer payload");
+        let parsed = parse_invoicer_layout(&unaligned[9..9 + INVOICER_ACCOUNT_LEN - 8])
+            .expect("unaligned invoicer payload");
         assert_eq!(parsed.2, reserves);
     }
 
