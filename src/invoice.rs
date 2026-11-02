@@ -300,29 +300,54 @@ pub fn filter_invoices(
     Ok(invoices)
 }
 
-/// Unpaid invoices for one vote account, whichever invoicer issued them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Unpaid invoices for one vote account, whichever invoicer issued them, as
+/// (invoice address, epoch).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnpaidInvoices {
-    pub count: u64,
+    pub invoices: Vec<(Pubkey, u64)>,
+}
+
+impl UnpaidInvoices {
+    pub fn count(&self) -> u64 {
+        self.invoices.len() as u64
+    }
+
     /// Oldest unpaid epoch, 0 when nothing is unpaid.
-    pub oldest_epoch: u64,
+    pub fn oldest_epoch(&self) -> u64 {
+        self.invoices
+            .iter()
+            .map(|(_, epoch)| *epoch)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The state after a confirmed payment of `paid`: the scan ran before
+    /// paying, so without this the metrics would report the just-paid
+    /// invoices as open until the next run.
+    pub fn without(&self, paid: &[Invoice]) -> Self {
+        Self {
+            invoices: self
+                .invoices
+                .iter()
+                .filter(|(address, _)| !paid.iter().any(|invoice| invoice.address == *address))
+                .copied()
+                .collect(),
+        }
+    }
 }
 
 pub fn summarize_unpaid(invoices: &[Invoice], vote_account: Pubkey) -> UnpaidInvoices {
-    let mut summary = UnpaidInvoices::default();
-    for invoice in invoices {
-        if invoice.vote_account != vote_account
-            || invoice.epoch < FIRST_INVOICE_EPOCH
-            || invoice.balance_outstanding == 0
-        {
-            continue;
-        }
-        summary.count += 1;
-        if summary.oldest_epoch == 0 || invoice.epoch < summary.oldest_epoch {
-            summary.oldest_epoch = invoice.epoch;
-        }
-    }
-    summary
+    let mut invoices = invoices
+        .iter()
+        .filter(|invoice| {
+            invoice.vote_account == vote_account
+                && invoice.epoch >= FIRST_INVOICE_EPOCH
+                && invoice.balance_outstanding > 0
+        })
+        .map(|invoice| (invoice.address, invoice.epoch))
+        .collect::<Vec<_>>();
+    invoices.sort_unstable_by_key(|(address, epoch)| (*epoch, *address));
+    UnpaidInvoices { invoices }
 }
 
 #[cfg(test)]
@@ -485,14 +510,16 @@ mod tests {
                 ..invoice(new_invoicer, 1000, 10)
             },
         ];
-        assert_eq!(
-            summarize_unpaid(&invoices, vote),
-            UnpaidInvoices {
-                count: 2,
-                oldest_epoch: 1065
-            }
-        );
-        assert_eq!(summarize_unpaid(&[], vote), UnpaidInvoices::default());
+        let unpaid = summarize_unpaid(&invoices, vote);
+        assert_eq!(unpaid.count(), 2);
+        assert_eq!(unpaid.oldest_epoch(), 1065);
+        assert_eq!(summarize_unpaid(&[], vote).oldest_epoch(), 0);
+
+        // After paying 1065 only 1066 is left; after paying both, nothing.
+        let after = unpaid.without(&[invoices[3].clone()]);
+        assert_eq!((after.count(), after.oldest_epoch()), (1, 1066));
+        let after = unpaid.without(&[invoices[2].clone(), invoices[3].clone()]);
+        assert_eq!((after.count(), after.oldest_epoch()), (0, 0));
     }
 
     #[test]

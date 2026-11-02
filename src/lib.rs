@@ -300,8 +300,7 @@ mod tests {
                 invoicer_reserves: Pubkey::new_unique(),
                 current_epoch: 781,
                 unpaid: crate::invoice::UnpaidInvoices {
-                    count: 1,
-                    oldest_epoch: 780,
+                    invoices: vec![(find_invoice_address(&invoicer_address(), &vote, 780), 780)],
                 },
                 vlp_pool: ValidatedVlpPool {
                     sol_vault: crate::payment::vlp_sol_vault_address(),

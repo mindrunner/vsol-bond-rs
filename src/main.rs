@@ -185,7 +185,9 @@ fn print_plan(plan: &PaymentPlan) {
     }
     println!(
         "unpaid: {} invoice(s) for the vote account across all invoicers, oldest epoch {}, current epoch {}",
-        plan.unpaid.count, plan.unpaid.oldest_epoch, plan.current_epoch
+        plan.unpaid.count(),
+        plan.unpaid.oldest_epoch(),
+        plan.current_epoch
     );
 }
 
@@ -202,6 +204,12 @@ fn metrics_for(
     success: bool,
     paid_invoice_count: usize,
 ) -> RunMetrics {
+    // paid > 0 only after a confirmed payment of all plan.invoices.
+    let unpaid = if success && paid_invoice_count > 0 {
+        plan.unpaid.without(&plan.invoices)
+    } else {
+        plan.unpaid.clone()
+    };
     RunMetrics {
         last_run_timestamp_seconds: now_seconds(),
         success,
@@ -216,8 +224,8 @@ fn metrics_for(
         },
         payer_sol_balance_lamports: plan.payer_sol_balance_lamports,
         payer_vsol_balance_base_units: plan.existing_vsol,
-        unpaid_invoice_count: plan.unpaid.count,
-        oldest_unpaid_invoice_epoch: plan.unpaid.oldest_epoch,
+        unpaid_invoice_count: unpaid.count(),
+        oldest_unpaid_invoice_epoch: unpaid.oldest_epoch(),
         current_epoch: plan.current_epoch,
     }
 }
@@ -721,5 +729,11 @@ mod tests {
         }
         let metrics = std::fs::read_to_string(&metrics_path).unwrap();
         assert!(metrics.contains("vsol_bond_last_run_success 1"));
+        assert!(metrics.contains("vsol_bond_paid_invoice_count 1"));
+        // The scan saw the invoice unpaid before paying; the metrics must
+        // report the state after the confirmed payment.
+        assert!(metrics.contains("vsol_bond_unpaid_invoice_count 0"));
+        assert!(metrics.contains("vsol_bond_oldest_unpaid_invoice_epoch 0"));
+        assert!(metrics.contains("vsol_bond_current_epoch 781"));
     }
 }
