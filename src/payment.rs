@@ -489,8 +489,10 @@ mod tests {
             vlp_pool: pool(),
             current_epoch: 782,
             unpaid: UnpaidInvoices {
-                count: 2,
-                oldest_epoch: 780,
+                invoices: vec![
+                    (invoice(780, 10, 3).address, 780),
+                    (invoice(781, 10, 2).address, 781),
+                ],
             },
         }
     }
