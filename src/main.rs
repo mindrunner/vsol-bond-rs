@@ -177,6 +177,16 @@ fn print_plan(plan: &PaymentPlan) {
         plan.vsol_shortfall,
         plan.deposit_sol_lamports
     );
+    for invoice in &plan.invoices {
+        println!(
+            "  invoice epoch {} from invoicer {}: {} of {} vSOL base units outstanding",
+            invoice.epoch, invoice.invoicer, invoice.balance_outstanding, invoice.amount_vsol
+        );
+    }
+    println!(
+        "unpaid: {} invoice(s) for the vote account across all invoicers, oldest epoch {}, current epoch {}",
+        plan.unpaid.count, plan.unpaid.oldest_epoch, plan.current_epoch
+    );
 }
 
 fn now_seconds() -> u64 {
@@ -206,6 +216,9 @@ fn metrics_for(
         },
         payer_sol_balance_lamports: plan.payer_sol_balance_lamports,
         payer_vsol_balance_base_units: plan.existing_vsol,
+        unpaid_invoice_count: plan.unpaid.count,
+        oldest_unpaid_invoice_epoch: plan.unpaid.oldest_epoch,
+        current_epoch: plan.current_epoch,
     }
 }
 
@@ -223,6 +236,9 @@ fn failure_metrics(phase: RunPhase, plan: Option<&PaymentPlan>) -> RunMetrics {
             deposited_sol_lamports: 0,
             payer_sol_balance_lamports: 0,
             payer_vsol_balance_base_units: 0,
+            unpaid_invoice_count: 0,
+            oldest_unpaid_invoice_epoch: 0,
+            current_epoch: 0,
         }
     }
 }
@@ -262,8 +278,7 @@ mod tests {
     use base64::Engine as _;
     use clap::Parser;
     use solana_pubkey::Pubkey;
-    use solana_stake_interface::state::{Authorized, Lockup, Meta, StakeStateV2};
-    use spl_stake_pool::state::{AccountType, StakePool};
+    use std::str::FromStr;
     use std::{
         cell::{Cell, RefCell},
         path::{Path, PathBuf},
@@ -272,14 +287,8 @@ mod tests {
     };
     use tiny_http::{Response, Server};
     use vsol_bond_rs::{
-        invoice::{
-            INVOICER_ACCOUNT_LEN, INVOICER_DISCRIMINATOR, find_invoicer_address, invoicer_address,
-            invoicer_base, invoicer_program_id,
-        },
-        payment::{
-            associated_token_address, stake_pool_address, stake_pool_program_id, token_program_id,
-            vsol_mint,
-        },
+        invoice::{TRUSTED_INVOICERS, find_invoice_address, invoicer_program_id},
+        payment::{liquid_unstaker_program_id, token_program_id, vlp_mint},
     };
 
     #[test]
@@ -462,89 +471,62 @@ mod tests {
         let url = format!("http://{}", server.server_addr());
         let payer = payer_override.unwrap_or_else(Pubkey::new_unique);
         let vote = Pubkey::new_unique();
-        let manager = Pubkey::new_unique();
-        let manager_fee = Pubkey::new_unique();
-        let reserve = Pubkey::new_unique();
-        let (withdraw_authority, withdraw_bump) =
-            spl_stake_pool::find_withdraw_authority_program_address(
-                &stake_pool_program_id(),
-                &stake_pool_address(),
-            );
-        let reserves = associated_token_address(&invoicer_address(), &vsol_mint());
-
-        let mut invoicer_data = Vec::with_capacity(INVOICER_ACCOUNT_LEN);
-        invoicer_data.extend_from_slice(&INVOICER_DISCRIMINATOR);
-        invoicer_data.extend_from_slice(invoicer_base().as_ref());
-        invoicer_data.push(find_invoicer_address().1);
-        invoicer_data.extend_from_slice(&[0; 7]);
-        invoicer_data.extend_from_slice(reserves.as_ref());
-        for fill in 1..=4 {
-            invoicer_data.extend_from_slice(&[fill; 32]);
-        }
-
-        let mut mint_data = vec![0; 82];
-        mint_data[..4].copy_from_slice(&1_u32.to_le_bytes());
-        mint_data[4..36].copy_from_slice(withdraw_authority.as_ref());
-        mint_data[36..44].copy_from_slice(&10_000_u64.to_le_bytes());
-        mint_data[44] = 9;
-        mint_data[45] = 1;
-
+        // The real SaaS invoicer (trusted, VLP); the community-pool one is
+        // reported missing.
+        let invoicer = Pubkey::from_str(TRUSTED_INVOICERS[0]).unwrap();
+        let invoicer_data = include_bytes!("../tests/fixtures/mainnet_saas_invoicer.bin").to_vec();
         let current_epoch: u64 = if pay_mode { 781 } else { 780 };
-        let pool = StakePool {
-            account_type: AccountType::StakePool,
-            manager,
-            stake_withdraw_bump_seed: withdraw_bump,
-            reserve_stake: reserve,
-            pool_mint: vsol_mint(),
-            manager_fee_account: manager_fee,
-            token_program_id: token_program_id(),
-            total_lamports: 10_000,
-            pool_token_supply: 10_000,
-            last_update_epoch: current_epoch,
-            ..StakePool::default()
-        };
-        let pool_data = borsh::to_vec(&pool).unwrap();
 
         let token_data = |owner: Pubkey, amount: u64| {
             let mut data = vec![0; 165];
-            data[..32].copy_from_slice(vsol_mint().as_ref());
+            data[..32].copy_from_slice(vlp_mint().as_ref());
             data[32..64].copy_from_slice(owner.as_ref());
             data[64..72].copy_from_slice(&amount.to_le_bytes());
             data[108] = 1;
             data
         };
-        let mut reserve_data = bincode::serialize(&StakeStateV2::Initialized(Meta {
-            rent_exempt_reserve: 1,
-            authorized: Authorized::auto(&withdraw_authority),
-            lockup: Lockup::default(),
-        }))
-        .unwrap();
-        reserve_data.resize(200, 0);
-        let mut first_accounts = vec![
+        let invoicers = vec![
             rpc_account(invoicer_program_id(), invoicer_data),
-            rpc_account(token_program_id(), mint_data),
-            rpc_account(stake_pool_program_id(), pool_data),
-            rpc_account(token_program_id(), token_data(payer, 0)),
-            rpc_account(token_program_id(), token_data(invoicer_address(), 0)),
+            serde_json::Value::Null,
         ];
+        let mut invoice_accounts = Vec::new();
+        let mut scanned_invoices = Vec::new();
         if pay_mode {
             // One outstanding invoice for the single candidate epoch 780.
             let mut invoice_data = Vec::with_capacity(96);
             invoice_data.extend_from_slice(&vsol_bond_rs::invoice::INVOICE_DISCRIMINATOR);
-            invoice_data.extend_from_slice(invoicer_address().as_ref());
+            invoice_data.extend_from_slice(invoicer.as_ref());
             invoice_data.extend_from_slice(vote.as_ref());
             invoice_data.extend_from_slice(&780_u64.to_le_bytes());
             invoice_data.extend_from_slice(&1_000_u64.to_le_bytes());
             invoice_data.extend_from_slice(&1_000_u64.to_le_bytes());
-            first_accounts.push(rpc_account(invoicer_program_id(), invoice_data));
+            let invoice = rpc_account(invoicer_program_id(), invoice_data);
+            scanned_invoices.push(serde_json::json!({
+                "pubkey": find_invoice_address(&invoicer, &vote, 780).to_string(),
+                "account": invoice.clone(),
+            }));
+            invoice_accounts.push(invoice);
         }
-        let second_accounts = vec![
-            rpc_account(solana_stake_interface::program::id(), reserve_data),
-            rpc_account(token_program_id(), token_data(manager, 0)),
-        ];
+        // Plan mode has no candidate epoch, so no invoice lookup is sent.
+        let mut account_responses = vec![invoicers];
+        if pay_mode {
+            account_responses.push(invoice_accounts);
+        }
+        account_responses.push(vec![
+            rpc_account(
+                liquid_unstaker_program_id(),
+                include_bytes!("../tests/fixtures/mainnet_vlp_pool.bin").to_vec(),
+            ),
+            rpc_account(
+                liquid_unstaker_program_id(),
+                include_bytes!("../tests/fixtures/mainnet_vlp_inventory_summary.bin").to_vec(),
+            ),
+            rpc_account(token_program_id(), token_data(payer, 0)),
+            rpc_account(token_program_id(), token_data(invoicer, 0)),
+        ]);
         let methods = Arc::new(Mutex::new(Vec::new()));
         let thread_methods = Arc::clone(&methods);
-        let request_count = if pay_mode { 8 } else { 4 };
+        let request_count = if pay_mode { 10 } else { 5 };
         let handle = std::thread::spawn(move || {
             let mut account_call = 0;
             for mut request in server.incoming_requests().take(request_count) {
@@ -563,13 +545,17 @@ mod tests {
                         "transactionCount": 0
                     }),
                     "getMultipleAccounts" => {
+                        let value = account_responses[account_call].clone();
                         account_call += 1;
-                        let value = if account_call == 1 {
-                            first_accounts.clone()
-                        } else {
-                            second_accounts.clone()
-                        };
                         serde_json::json!({"context": {"slot": 1}, "value": value})
+                    }
+                    "getProgramAccounts" => {
+                        assert_eq!(payload["params"][0], invoicer_program_id().to_string());
+                        assert_eq!(payload["params"][1]["encoding"], "base64");
+                        let vote_filter = &payload["params"][1]["filters"][1]["memcmp"];
+                        assert_eq!(vote_filter["offset"], 40);
+                        assert_eq!(vote_filter["bytes"], vote.to_string());
+                        serde_json::json!(scanned_invoices)
                     }
                     "getBalance" => {
                         serde_json::json!({"context": {"slot": 1}, "value": 200000000})

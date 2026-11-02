@@ -32,6 +32,12 @@ pub struct RunMetrics {
     pub deposited_sol_lamports: u64,
     pub payer_sol_balance_lamports: u64,
     pub payer_vsol_balance_base_units: u64,
+    /// Unpaid invoices for the vote account from any invoicer, also those
+    /// outside the payable window, so a gap shows even when nothing is paid.
+    pub unpaid_invoice_count: u64,
+    /// Oldest unpaid invoice epoch, 0 when nothing is unpaid.
+    pub oldest_unpaid_invoice_epoch: u64,
+    pub current_epoch: u64,
 }
 
 pub trait MetricsSink {
@@ -108,6 +114,17 @@ pub fn render_prometheus(metrics: &RunMetrics) -> Result<String> {
         "vsol_bond_payer_vsol_balance_base_units {}",
         metrics.payer_vsol_balance_base_units
     )?;
+    writeln!(
+        output,
+        "vsol_bond_unpaid_invoice_count {}",
+        metrics.unpaid_invoice_count
+    )?;
+    writeln!(
+        output,
+        "vsol_bond_oldest_unpaid_invoice_epoch {}",
+        metrics.oldest_unpaid_invoice_epoch
+    )?;
+    writeln!(output, "vsol_bond_current_epoch {}", metrics.current_epoch)?;
     Ok(output)
 }
 
@@ -193,6 +210,9 @@ mod tests {
             deposited_sol_lamports: 100,
             payer_sol_balance_lamports: 1_000,
             payer_vsol_balance_base_units: 7,
+            unpaid_invoice_count: 2,
+            oldest_unpaid_invoice_epoch: 1065,
+            current_epoch: 1073,
         }
     }
 
@@ -209,6 +229,9 @@ mod tests {
             "vsol_bond_deposited_sol_lamports 100",
             "vsol_bond_payer_sol_balance_lamports 1000",
             "vsol_bond_payer_vsol_balance_base_units 7",
+            "vsol_bond_unpaid_invoice_count 2",
+            "vsol_bond_oldest_unpaid_invoice_epoch 1065",
+            "vsol_bond_current_epoch 1073",
         ] {
             assert!(body.contains(metric), "missing {metric}");
         }
